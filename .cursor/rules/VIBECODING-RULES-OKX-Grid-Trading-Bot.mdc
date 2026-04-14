@@ -1,0 +1,302 @@
+---
+alwaysApply: true
+---
+
+## 🧠 FILOSOFÍA
+
+Bot financiero con dinero real. Cada línea tiene consecuencias económicas.
+- **Cauto antes que rápido**
+- **DRY_RUN siempre activo hasta estar seguro**
+- **Una responsabilidad por módulo**
+
+---
+
+## 📁 ESTRUCTURA
+
+```
+okx-grid-bot/
+├── src/
+│   ├── connectors/
+│   │   └── okx_client.py         # Wrapper de ccxt
+│   ├── core/
+│   │   ├── price_reader.py       # Lee precio actual
+│   │   ├── order_manager.py      # Coloca/cancela órdenes
+│   │   ├── grid_state.py         # Persiste estado en JSON
+│   │   └── bot_loop.py           # Orquestador principal
+│   ├── strategy/
+│   │   └── grid_calculator.py    # Calcula niveles de grilla
+│   ├── risk/
+│   │   └── risk_manager.py       # Validaciones de riesgo
+│   └── utils/
+│       ├── logger.py             # Logging JSON
+│       └── config.py             # Carga .env y config.yaml
+├── tests/unit/
+├── tests/integration/
+├── data/
+│   └── grid_state.json           # Estado de la grilla
+├── logs/
+├── config.yaml
+├── .env                          # NUNCA commitear
+├── .env.example
+├── requirements.txt
+└── main.py
+```
+
+---
+
+## ⚙️ STACK
+
+| Herramienta | Propósito |
+|---|---|
+| Python 3.11+ | Lenguaje |
+| ccxt | API OKX |
+| python-dotenv | Variables de entorno |
+| structlog | Logging JSON |
+| pyyaml | Configuración |
+| tenacity | Retry logic |
+| pytest + pytest-mock | Testing |
+
+---
+
+## 🔐 SEGURIDAD (NO NEGOCIABLE)
+
+```python
+# ❌ NUNCA
+API_KEY = "abc123"
+logger.info(f"Key: {api_key}")
+
+# ✅ SIEMPRE
+api_key = os.getenv("OKX_API_KEY")
+if not api_key:
+    raise ValueError("OKX_API_KEY no configurada")
+```
+
+### `.env.example`
+```env
+# OKX Credentials
+OKX_API_KEY=your_api_key_here
+OKX_API_SECRET=your_api_secret_here
+OKX_API_PASSPHRASE=your_passphrase_here
+
+# Seguridad
+DRY_RUN=true
+
+# Logging
+LOG_LEVEL=INFO
+```
+
+---
+
+## 🤖 INSTRUCCIONES PARA LA IA
+
+### Template de prompt por módulo:
+```
+Contexto: Estoy en [MÓDULO], que hace [RESPONSABILIDAD].
+Ya implementados: [LISTA DE MÓDULOS EXISTENTES].
+Tarea: Implementar [FUNCIÓN] que recibe [INPUT] y retorna [OUTPUT].
+Restricciones:
+- DRY_RUN debe estar soportado
+- Mockear ccxt en los tests
+- Parámetros desde config.yaml
+Incluir test unitario.
+```
+
+---
+
+## 📏 CONVENCIONES
+
+```python
+# Type hints obligatorios
+def place_order(
+    symbol: str,
+    side: str,
+    price: float,
+    amount: float
+) -> dict | None:
+    pass
+
+# Constantes
+MAX_ORDER_USDT = 2.0
+MIN_PRICE_DISTANCE = 0.01
+
+# Docstrings en funciones públicas
+def calculate_grid_levels(
+    price_min: float,
+    price_max: float,
+    num_levels: int
+) -> list[float]:
+    """
+    Calcula los niveles de precio de la grilla.
+    
+    Args:
+        price_min: Precio mínimo del rango
+        price_max: Precio máximo del rango
+        num_levels: Número de niveles
+    
+    Returns:
+        Lista de precios ordenados de menor a mayor
+    """
+```
+
+---
+
+## 🛡️ MANEJO DE ERRORES
+
+```python
+# ✅ Específico con contexto
+try:
+    order = client.create_limit_buy_order(symbol, amount, price)
+except ccxt.InsufficientFunds as e:
+    logger.warning("balance_insuficiente", 
+                   required=amount * price, 
+                   available=balance)
+    return None
+except ccxt.RateLimitExceeded:
+    logger.warning("rate_limit_alcanzado")
+    time.sleep(1)
+
+# ❌ Nunca silencioso
+try:
+    order = client.create_order(...)
+except Exception:
+    pass
+```
+
+### Circuit breaker
+```python
+MAX_DAILY_LOSS_USDT = 2.0    # Parar si perdés $2 en el día
+MAX_CONSECUTIVE_ERRORS = 5    # Parar si hay 5 errores seguidos
+```
+
+---
+
+## 📊 LOGGING
+
+```python
+# ✅ Con contexto útil
+logger.info("orden_colocada",
+    symbol="BTC/USDT",
+    side="buy",
+    price=85000.0,
+    amount=0.0001,
+    dry_run=DRY_RUN
+)
+
+logger.info("grid_calculada",
+    levels=[80000, 82500, 85000, 87500, 90000],
+    capital_por_nivel=2.0
+)
+```
+
+| Nivel | Cuándo |
+|---|---|
+| DEBUG | Precios leídos, cálculos intermedios |
+| INFO | Órdenes, inicio/fin ciclo, balance |
+| WARNING | Rate limits, orden rechazada |
+| ERROR | Falla de API, error de red |
+| CRITICAL | Circuit breaker activado |
+
+---
+
+## 🧪 TESTING
+
+```python
+# Mockear ccxt siempre en unit tests
+from unittest.mock import MagicMock
+
+def test_calcula_niveles_correctamente():
+    calc = GridCalculator(price_min=80000, price_max=90000, num_levels=5)
+    levels = calc.calculate()
+    assert levels == [80000, 82500, 85000, 87500, 90000]
+
+def test_dry_run_no_llama_al_exchange():
+    mock_exchange = MagicMock()
+    client = OKXClient(exchange=mock_exchange, dry_run=True)
+    client.place_order("BTC/USDT", "buy", 85000, 0.001)
+    mock_exchange.create_limit_buy_order.assert_not_called()
+```
+
+---
+
+## 🔄 FASES DE DESARROLLO
+
+### Fase 1 — Solo lectura
+**Señal de éxito:** `python main.py --mode=scan` loggea precio BTC/USDT y balance USDT.
+
+Archivos:
+- `src/utils/logger.py`
+- `src/utils/config.py`
+- `src/connectors/okx_client.py`
+- `src/core/price_reader.py`
+- `main.py --mode=scan`
+
+### Fase 2 — Grid en DRY_RUN
+**Señal de éxito:** El bot loggea "orden simulada BUY BTC/USDT a $X" sin gastar dinero.
+
+Archivos:
+- `src/strategy/grid_calculator.py`
+- `src/core/order_manager.py` (DRY_RUN)
+- `src/core/grid_state.py`
+- `src/risk/risk_manager.py`
+
+### Fase 3 — Loop real
+**Señal de éxito:** Bot corre 10 ciclos en DRY_RUN sin errores, luego activar con $10 reales.
+
+Archivos:
+- `src/core/bot_loop.py`
+- `main.py --mode=live`
+
+---
+
+## ⚙️ CONFIG.YAML
+
+```yaml
+grid:
+  symbol: "BTC/USDT"
+  price_min: 80000
+  price_max: 90000
+  num_levels: 5
+  total_capital_usdt: 10.0
+  max_order_usdt: 2.0
+
+risk:
+  max_daily_loss_usdt: 2.0
+  max_open_orders: 10
+  min_order_usdt: 0.5
+
+loop:
+  interval_seconds: 30
+  max_consecutive_errors: 5
+```
+
+---
+
+## ⚠️ ANTIPATRONES
+
+```python
+# ❌ Hardcodear precios
+if price < 85000:  # debe venir de config
+
+# ❌ Todo el capital en una orden
+amount = total_balance / price  # usar max_order_usdt
+
+# ❌ Sin validar antes de ejecutar
+client.create_order(symbol, amount, price)  # verificar balance primero
+
+# ❌ Loggear secrets
+logger.debug(f"Key: {os.getenv('OKX_API_KEY')}")
+```
+
+---
+
+## 📝 DIFERENCIAS CON POLYMARKET
+
+| Aspecto | Polymarket | OKX |
+|---|---|---|
+| Autenticación | Private key + wallet | API Key + Secret + Passphrase |
+| Balance | On-chain + proxy wallet | Directo via API |
+| Órdenes | CLOB on-chain | REST API simple |
+| Gas | Necesita MATIC | No necesita |
+| Complejidad | Alta (DeFi) | Baja (CeFi) |
+
+---

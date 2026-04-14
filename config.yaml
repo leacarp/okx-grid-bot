@@ -1,0 +1,29 @@
+grid:
+  symbol: "BTC/USDT"
+  price_min: 71300
+  price_max: 74300
+  num_levels: 6
+  total_capital_usdt: 5.0
+  max_order_usdt: 1
+
+risk:
+  max_daily_loss_usdt: 2.0
+  max_open_orders: 10
+  min_profit_per_trade_pct: 0.3
+
+exchange:
+  sandbox: false
+
+loop:
+  interval_seconds: 5
+  max_consecutive_errors: 5
+
+trailing:
+  recenter_every_cycles: 1440
+  min_step_usdt: 600
+
+logging:
+  level: "INFO"
+  file: "logs/bot.log"
+  max_bytes: 10485760
+  backup_count: 5

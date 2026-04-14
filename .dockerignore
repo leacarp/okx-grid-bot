@@ -1,0 +1,25 @@
+# Secretos — nunca en la imagen
+.env
+
+# Logs generados en runtime
+logs/
+
+# Estado de la grilla — persiste en el volumen de Fly, no en la imagen
+data/grid_state.json
+
+# Caché de Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Caché de pytest y coverage
+.pytest_cache/
+.coverage
+
+# Tests no necesarios en producción
+tests/
+
+# Archivos del editor e IDE
+.cursor/
+.git/
+*.md
