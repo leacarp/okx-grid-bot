@@ -4,6 +4,7 @@ Tests unitarios para OrderManager.
 from __future__ import annotations
 
 import pytest
+import ccxt
 
 from src.core.order_manager import OrderManager
 from src.risk.risk_manager import RiskManager
@@ -106,14 +107,79 @@ class TestPlaceInitialOrders:
         placed = om.place_initial_orders(levels, 67500.0)
 
         assert placed == 0
+        # Solo los niveles BUY pasan por el risk check; los SELL son sell_pending
+        buy_levels = [l for l in levels if l.price < 67500.0]
         blocked = [l for l in grid_state.levels if l["status"] == "blocked"]
-        assert len(blocked) == len(levels)
+        assert len(blocked) == len(buy_levels)
 
     def test_estado_persiste_en_disco(self, mock_client, grid_state):
         om = make_order_manager(mock_client, grid_state)
         om.place_initial_orders(make_grid_levels(), 67500.0)
 
         assert grid_state._path.exists()
+
+    def test_insufficient_funds_no_aborta_inicializacion(
+        self, mock_client_live, grid_state
+    ):
+        """
+        Si OKX responde InsufficientFunds, la orden falla silenciosamente
+        (level queda en 'error'), pero place_initial_orders no propaga la excepción.
+        El bot puede seguir corriendo con 0 órdenes colocadas.
+        """
+        mock_client_live._exchange.create_order.side_effect = ccxt.InsufficientFunds(
+            "Order failed. Your available USDT balance is insufficient."
+        )
+        om = make_order_manager(mock_client_live, grid_state)
+        levels = make_grid_levels()
+
+        placed = om.place_initial_orders(levels, 67500.0)
+
+        assert placed == 0
+        error_levels = [l for l in grid_state.levels if l["status"] == "error"]
+        buy_levels = [l for l in levels if l.price < 67500.0]
+        assert len(error_levels) == len(buy_levels)
+
+
+    def test_base_disponible_bajo_minimo_okx_no_coloca_sells(self, mock_client, grid_state):
+        """
+        Si el BTC disponible dividido entre los niveles SELL queda por debajo de
+        0.00001 BTC (mínimo OKX), no debe colocarse ninguna orden SELL.
+        Todos los niveles sobre el precio actual deben quedar en 'sell_pending'.
+        """
+        om = make_order_manager(mock_client, grid_state)
+        levels = make_grid_levels()
+        current_price = 67500.0
+
+        # 0.00001127 BTC / 2 niveles SELL ≈ 0.000005635 BTC < 0.00001 → debajo del mínimo
+        base_available_insuficiente = 0.00001127
+
+        placed = om.place_initial_orders(
+            levels, current_price, base_available=base_available_insuficiente
+        )
+
+        sell_levels = [l for l in grid_state.levels if l["price"] >= current_price]
+        # Ningún nivel SELL debe estar en sell_open
+        assert all(l["status"] == "sell_pending" for l in sell_levels)
+        # Solo los BUYs deben estar colocados
+        buy_levels = [l for l in grid_state.levels if l["price"] < current_price]
+        assert placed == len([l for l in buy_levels if l["status"] == "buy_open"])
+
+    def test_base_disponible_suficiente_coloca_sells(self, mock_client, grid_state):
+        """Si el BTC por nivel supera 0.00001, las órdenes SELL deben colocarse."""
+        om = make_order_manager(mock_client, grid_state)
+        levels = make_grid_levels()
+        current_price = 67500.0
+
+        # 0.0001 BTC / 2 niveles SELL = 0.00005 BTC > 0.00001 → válido
+        base_available_ok = 0.0001
+
+        om.place_initial_orders(levels, current_price, base_available=base_available_ok)
+
+        sell_open = [
+            l for l in grid_state.levels
+            if l["price"] >= current_price and l["status"] == "sell_open"
+        ]
+        assert len(sell_open) > 0
 
 
 # ------------------------------------------------------------------

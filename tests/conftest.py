@@ -12,6 +12,27 @@ from src.strategy.grid_state import GridState
 
 
 # ------------------------------------------------------------------
+# Silenciar Telegram en TODOS los tests
+# ------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _silence_telegram(mocker):
+    """
+    Evita que los tests envíen notificaciones reales a Telegram.
+
+    Se aplica automáticamente a cada test. Parchea la clase
+    TelegramNotifier en el módulo bot_loop para que cualquier
+    instancia creada implícitamente (cuando no se inyecta notifier)
+    sea un MagicMock silencioso.
+
+    Los tests que inyectan su propio mock_notifier no se ven
+    afectados porque BotLoop usa ese objeto en lugar de instanciar
+    la clase parcheada.
+    """
+    mocker.patch("src.core.bot_loop.TelegramNotifier")
+
+
+# ------------------------------------------------------------------
 # Configuración de prueba
 # ------------------------------------------------------------------
 

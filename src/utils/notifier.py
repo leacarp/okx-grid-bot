@@ -37,14 +37,26 @@ class TelegramNotifier:
         token: str | None = None,
         chat_id: str | None = None,
     ) -> None:
-        self._token: str | None = token or os.getenv("TELEGRAM_TOKEN")
+        # Soportar tanto TELEGRAM_TOKEN como TELEGRAM_BOT_TOKEN (convención alternativa)
+        self._token: str | None = (
+            token
+            or os.getenv("TELEGRAM_TOKEN")
+            or os.getenv("TELEGRAM_BOT_TOKEN")
+        )
         self._chat_id: str | None = chat_id or os.getenv("TELEGRAM_CHAT_ID")
         self._enabled: bool = bool(self._token and self._chat_id)
 
-        if not self._enabled:
+        if self._enabled:
             logger.info(
+                "notifier_habilitado",
+                chat_id_preview=f"{self._chat_id[:4]}****" if self._chat_id else None,
+            )
+        else:
+            logger.warning(
                 "notifier_deshabilitado",
-                razon="TELEGRAM_TOKEN o TELEGRAM_CHAT_ID no configurados",
+                token_configurado=bool(self._token),
+                chat_id_configurado=bool(self._chat_id),
+                hint="Configurar TELEGRAM_TOKEN (o TELEGRAM_BOT_TOKEN) y TELEGRAM_CHAT_ID",
             )
 
     # ------------------------------------------------------------------
@@ -118,6 +130,18 @@ class TelegramNotifier:
             f"Precio actual: ${current_price:,.2f}\n"
             f"Nuevo rango: ${new_min:,.2f} - ${new_max:,.2f}\n"
             f"Step: ${step:,.2f}"
+        )
+
+    def notify_no_usdt_available(
+        self,
+        usdt_available: float,
+        required: float,
+    ) -> None:
+        """Notifica que no hay USDT suficiente para recentrar la grilla."""
+        self.send(
+            f"\u26a0\ufe0f Sin USDT disponible - esperando ejecución de SELLs\n"
+            f"USDT disponible: ${usdt_available:,.4f}\n"
+            f"Mínimo requerido: ${required:,.4f}"
         )
 
     # ------------------------------------------------------------------

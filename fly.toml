@@ -2,15 +2,23 @@
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
+# ⚠️  SINGLE MACHINE: este bot es un worker background, no necesita HA.
+#     Siempre deployar con:  fly deploy --ha=false
+#     Si hay más de 1 máquina:  fly scale count 1
+#
 
 app = 'okx-grid-bot'
 primary_region = 'gru'
 
 [build]
 
+[deploy]
+  # immediate evita crear una máquina de reemplazo durante el deploy
+  strategy = "immediate"
+
 [machines]
-  auto_stop_machines = "off"
-  auto_start_machines = false
+  auto_stop_machines = "off"   # worker: nunca detener por inactividad
+  auto_start_machines = false  # no crear máquinas extra por tráfico HTTP
   min_machines_running = 1
 
 [[vm]]

@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# OKX minimum order size for BTC/USDT (exchange hard limit)
+_MIN_ORDER_BTC = 0.00001
+
 
 class OrderManager:
     """
@@ -49,30 +52,93 @@ class OrderManager:
         self,
         grid_levels: list["GridLevel"],
         current_price: float,
+        base_available: float = 0.0,
     ) -> int:
         """
-        Coloca órdenes BUY solo en niveles por debajo del precio actual.
+        Coloca órdenes BUY en niveles por debajo del precio actual y SELL en
+        niveles por encima usando el balance de la moneda base disponible.
 
-        Los niveles por encima se registran como 'sell_pending': el precio
-        queda guardado en estado para que el reciclado pueda colocar la SELL
-        correspondiente cuando una BUY se ejecute. No se intenta colocar SELL
-        en el arranque porque no hay BTC disponible, solo USDT.
+        Cuando base_available > 0 (ej. BTC ya comprado de sesiones anteriores),
+        lo distribuye equitativamente entre los niveles de venta y coloca órdenes
+        SELL reales en lugar de marcarlos como 'sell_pending'. Esto permite que el
+        bot retome la venta del BTC acumulado tras un reinicio con estado perdido.
 
         Si ya existe estado persistido, omite la colocación inicial
         para evitar duplicar órdenes al reiniciar el bot.
 
+        Args:
+            grid_levels: Niveles calculados por GridCalculator.
+            current_price: Precio actual del mercado.
+            base_available: Balance libre de la moneda base (ej. BTC) para SELLs.
+
         Returns:
-            Número de órdenes BUY colocadas exitosamente.
+            Número de órdenes colocadas exitosamente (BUYs + SELLs).
         """
         if self._state.levels:
             logger.info("ordenes_iniciales_omitidas | estado_existente_cargado")
             return 0
 
         levels_data: list[dict[str, Any]] = []
-        placed = 0
+        placed_buys = 0
+        placed_sells = 0
+
+        # Distribuir el BTC disponible entre los niveles de venta
+        sell_levels = [l for l in grid_levels if l.price >= current_price]
+        btc_per_sell = (base_available / len(sell_levels)) if (sell_levels and base_available > 0) else 0.0
+        btc_remaining = base_available
+
+        # Verificar que cada orden SELL supere el mínimo de OKX antes de intentar colocarlas.
+        # Con poco BTC dividido en muchos niveles, cada fracción puede quedar por debajo de
+        # 0.00001 BTC (~$0.76 a $76k) y OKX rechazaría la orden.
+        if btc_per_sell > 0 and btc_per_sell < _MIN_ORDER_BTC:
+            valor_aprox_usdt = btc_per_sell * current_price
+            logger.warning(
+                "btc_por_nivel_debajo_del_minimo_okx | skip_sells "
+                "btc_por_nivel=%.8f min_btc=%.5f valor_aprox=$%.4f "
+                "total_btc=%.8f niveles_sell=%d",
+                btc_per_sell,
+                _MIN_ORDER_BTC,
+                valor_aprox_usdt,
+                base_available,
+                len(sell_levels),
+            )
+            btc_per_sell = 0.0
+            btc_remaining = 0.0
+
+        if btc_per_sell > 0:
+            logger.info(
+                "btc_disponible_para_sells | amount=%.8f niveles_sell=%d btc_por_nivel=%.8f",
+                base_available,
+                len(sell_levels),
+                btc_per_sell,
+            )
 
         for level in grid_levels:
             if level.price >= current_price:
+                if btc_per_sell > 0 and btc_remaining >= btc_per_sell:
+                    order = self._client.create_limit_order(
+                        symbol=self._symbol,
+                        side="sell",
+                        amount=btc_per_sell,
+                        price=level.price,
+                    )
+                    if order:
+                        entry = self._level_dict(level, "sell", "sell_open", order["id"])
+                        entry["amount"] = btc_per_sell
+                        levels_data.append(entry)
+                        btc_remaining -= btc_per_sell
+                        placed_sells += 1
+                        logger.info(
+                            "orden_inicial_colocada | symbol=%s side=sell price=%.2f "
+                            "amount=%.8f order_id=%s",
+                            self._symbol,
+                            level.price,
+                            btc_per_sell,
+                            order["id"],
+                        )
+                        continue
+
+                # No hay BTC disponible o la orden falló → marcar como sell_pending
                 levels_data.append(self._level_dict(level, "sell", "sell_pending", None))
                 logger.debug(
                     "nivel_reservado_para_sell | price=%.2f index=%d",
@@ -104,7 +170,7 @@ class OrderManager:
                 levels_data.append(
                     self._level_dict(level, "buy", "buy_open", order["id"])
                 )
-                placed += 1
+                placed_buys += 1
                 logger.info(
                     "orden_inicial_colocada | symbol=%s side=buy price=%.2f "
                     "amount=%.8f order_id=%s",
@@ -128,12 +194,14 @@ class OrderManager:
         )
 
         logger.info(
-            "ordenes_iniciales_completas | buy_colocadas=%d sell_pendientes=%d total=%d",
-            placed,
+            "ordenes_iniciales_completas | buy_colocadas=%d sell_colocadas=%d "
+            "sell_pendientes=%d total=%d",
+            placed_buys,
+            placed_sells,
             sum(1 for l in levels_data if l["status"] == "sell_pending"),
             len(grid_levels),
         )
-        return placed
+        return placed_buys + placed_sells
 
     # ------------------------------------------------------------------
     # Monitoreo de órdenes ejecutadas

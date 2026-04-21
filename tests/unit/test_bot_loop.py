@@ -92,8 +92,32 @@ class TestBotLoopInicializacion:
         bot.run(max_cycles=1)
 
         assert bot.total_cycles == 1
-        # El estado debe haberse creado
         assert (tmp_path / "grid_state.json").exists()
+
+    def test_cancela_ordenes_huerfanas_antes_de_inicializar(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """En modo live, cancela órdenes abiertas del exchange antes de crear la grilla."""
+        sample_config["dry_run"] = False
+        mock_client.dry_run = False
+        mock_client._exchange.fetch_open_orders.return_value = [
+            {"id": "orphan_1", "symbol": "BTC/USDT"},
+            {"id": "orphan_2", "symbol": "BTC/USDT"},
+        ]
+
+        bot = make_bot_loop(sample_config, mock_client, tmp_path, mocker)
+        bot.run(max_cycles=1)
+
+        assert mock_client._exchange.cancel_order.call_count == 2
+
+    def test_no_cancela_huerfanas_en_dry_run(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """En dry_run, no se llama al exchange para cancelar órdenes huérfanas."""
+        bot = make_bot_loop(sample_config, mock_client, tmp_path, mocker)
+        bot.run(max_cycles=1)
+
+        mock_client._exchange.cancel_order.assert_not_called()
 
     def test_carga_estado_existente_sin_reinicializar(
         self, sample_config, mock_client, tmp_path, mocker
@@ -294,6 +318,272 @@ class TestBotLoopShutdown:
         # Tras el shutdown, las órdenes deben estar canceladas
         for level in gs.levels:
             assert level["status"] == "cancelled"
+
+
+# ------------------------------------------------------------------
+# Tests de chequeo de balance antes de recentrar
+# ------------------------------------------------------------------
+
+class TestBotLoopRecenterBalance:
+    """Verifica que _recenter_grid bloquea el recentrado si no hay USDT."""
+
+    def _make_bot_out_of_range(self, sample_config, mock_client, tmp_path, mocker):
+        """Crea un BotLoop con precio permanentemente fuera de rango."""
+        mocker.patch(_SLEEP_PATH)
+        gs = GridState(state_file=tmp_path / "grid_state.json")
+        rm = RiskManager(sample_config["risk"], sample_config["loop"])
+        pr = mocker.MagicMock(spec=PriceReader)
+        pr.get_current_price.return_value = 99999.0
+        pr.is_price_in_range.return_value = False
+        from src.core.order_manager import OrderManager as _OM
+        om = _OM(
+            client=mock_client,
+            risk_manager=rm,
+            grid_state=gs,
+            symbol=sample_config["grid"]["symbol"],
+            max_order_usdt=sample_config["grid"]["max_order_usdt"],
+        )
+        bot = BotLoop(
+            config=sample_config,
+            client=mock_client,
+            price_reader=pr,
+            risk_manager=rm,
+            grid_state=gs,
+            order_manager=om,
+        )
+        return bot, om, gs
+
+    def test_recenter_bloqueado_si_usdt_insuficiente(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Si USDT disponible < min_order_usdt, _recenter_grid retorna False y no coloca órdenes."""
+        mock_client._exchange.fetch_balance.return_value = {
+            "free": {"USDT": 0.1},
+        }
+        sample_config["risk"]["min_order_usdt"] = 0.5
+
+        bot, om, gs = self._make_bot_out_of_range(
+            sample_config, mock_client, tmp_path, mocker
+        )
+        bot.run(max_cycles=1)
+
+        # El ciclo se cuenta aunque el recentrado haya sido bloqueado
+        assert bot.total_cycles == 1
+        # No debe haber llamadas a create_limit_order (recentrado fue bloqueado)
+        mock_client._exchange.create_order.assert_not_called()
+
+    def test_recenter_procede_si_usdt_suficiente(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Si hay USDT suficiente, _recenter_grid procede normalmente."""
+        mock_client._exchange.fetch_balance.return_value = {
+            "free": {"USDT": 10.0},
+        }
+        sample_config["risk"]["min_order_usdt"] = 0.5
+
+        bot, om, gs = self._make_bot_out_of_range(
+            sample_config, mock_client, tmp_path, mocker
+        )
+        bot.run(max_cycles=1)
+
+        assert bot.total_cycles == 1
+        # No debe activar circuit breaker
+        assert bot._risk_manager.circuit_open is False
+
+    def _make_bot_no_usdt(self, sample_config, mock_client, tmp_path, mocker):
+        """Crea un BotLoop con precio fuera de rango y USDT insuficiente."""
+        mocker.patch(_SLEEP_PATH)
+        mock_client._exchange.fetch_balance.return_value = {"free": {"USDT": 0.0}}
+        sample_config["risk"]["min_order_usdt"] = 0.5
+
+        gs = GridState(state_file=tmp_path / "grid_state.json")
+        rm = RiskManager(sample_config["risk"], sample_config["loop"])
+        pr = mocker.MagicMock(spec=PriceReader)
+        pr.get_current_price.return_value = 99999.0
+        pr.is_price_in_range.return_value = False
+        mock_notifier = mocker.MagicMock()
+        om = OrderManager(
+            client=mock_client,
+            risk_manager=rm,
+            grid_state=gs,
+            symbol=sample_config["grid"]["symbol"],
+            max_order_usdt=sample_config["grid"]["max_order_usdt"],
+        )
+        bot = BotLoop(
+            config=sample_config,
+            client=mock_client,
+            price_reader=pr,
+            risk_manager=rm,
+            grid_state=gs,
+            order_manager=om,
+            notifier=mock_notifier,
+        )
+        return bot, mock_notifier
+
+    def test_notifier_llamado_cuando_usdt_insuficiente(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Verifica que se notifica por Telegram en el primer ciclo sin USDT."""
+        bot, mock_notifier = self._make_bot_no_usdt(
+            sample_config, mock_client, tmp_path, mocker
+        )
+        bot.run(max_cycles=1)
+
+        mock_notifier.notify_no_usdt_available.assert_called_once_with(
+            usdt_available=0.0,
+            required=0.5,
+        )
+
+    def test_notifier_no_se_repite_en_ciclos_seguidos(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """El throttling silencia las notificaciones repetidas dentro de la ventana de 6h."""
+        bot, mock_notifier = self._make_bot_no_usdt(
+            sample_config, mock_client, tmp_path, mocker
+        )
+        bot.run(max_cycles=5)
+
+        # Solo debe haberse enviado UNA notificación aunque hubo 5 ciclos sin USDT
+        mock_notifier.notify_no_usdt_available.assert_called_once()
+
+    def test_notifier_se_resetea_cuando_hay_usdt_de_nuevo(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Tras un recentrado exitoso, el timestamp se limpia y el próximo bloqueo notifica."""
+        mocker.patch(_SLEEP_PATH)
+        sample_config["risk"]["min_order_usdt"] = 0.5
+        # cooldown=1 para que en solo 3 ciclos se puedan probar 2 notificaciones:
+        # Ciclo 1: sin USDT → bloquea, notifica, cooldown=1
+        # Ciclo 2: cooldown 1→0 (decrementa), intenta → USDT=10 → recentra, resetea timestamp
+        # Ciclo 3: cooldown=0, intenta → sin USDT → bloquea, notifica de nuevo
+        sample_config.setdefault("trailing", {})["cooldown_cycles_after_error"] = 1
+
+        # _initialize_grid siempre lee balance (1 llamada extra al inicio)
+        mock_client._exchange.fetch_balance.side_effect = [
+            {"free": {"USDT": 10.0}},  # _initialize_grid
+            {"free": {"USDT": 0.0}},   # ciclo 1: bloqueado
+            {"free": {"USDT": 10.0}},  # ciclo 2: procede (cooldown ya decrementado a 0)
+            {"free": {"USDT": 0.0}},   # ciclo 3: bloqueado de nuevo
+        ]
+
+        gs = GridState(state_file=tmp_path / "grid_state.json")
+        rm = RiskManager(sample_config["risk"], sample_config["loop"])
+        pr = mocker.MagicMock(spec=PriceReader)
+        pr.get_current_price.return_value = 99999.0
+        pr.is_price_in_range.return_value = False
+        mock_notifier = mocker.MagicMock()
+        om = OrderManager(
+            client=mock_client,
+            risk_manager=rm,
+            grid_state=gs,
+            symbol=sample_config["grid"]["symbol"],
+            max_order_usdt=sample_config["grid"]["max_order_usdt"],
+        )
+        bot = BotLoop(
+            config=sample_config,
+            client=mock_client,
+            price_reader=pr,
+            risk_manager=rm,
+            grid_state=gs,
+            order_manager=om,
+            notifier=mock_notifier,
+        )
+        bot.run(max_cycles=3)
+
+        # Ciclo 1 y ciclo 3 notifican; ciclo 2 no (hay USDT, procede el recentrado)
+        assert mock_notifier.notify_no_usdt_available.call_count == 2
+
+    def test_recenter_usa_default_min_order_si_no_configurado(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Si min_order_usdt no está en risk_cfg, usa el default 0.5."""
+        # Remover min_order_usdt del config para forzar el default
+        sample_config["risk"].pop("min_order_usdt", None)
+        mock_client._exchange.fetch_balance.return_value = {
+            "free": {"USDT": 0.3},  # < 0.5 (default)
+        }
+
+        bot, om, gs = self._make_bot_out_of_range(
+            sample_config, mock_client, tmp_path, mocker
+        )
+        bot.run(max_cycles=1)
+
+        # Con 0.3 USDT y default de 0.5, el recentrado debe bloquearse
+        mock_client._exchange.create_order.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# Tests de cooldown tras recentrado fallido
+# ------------------------------------------------------------------
+
+class TestBotLoopRecenterCooldown:
+    """Verifica que el cooldown evita el loop infinito de reintentos."""
+
+    def _make_bot_out_of_range_no_usdt(self, sample_config, mock_client, tmp_path, mocker, cooldown):
+        mocker.patch(_SLEEP_PATH)
+        sample_config["risk"]["min_order_usdt"] = 0.5
+        sample_config.setdefault("trailing", {})["cooldown_cycles_after_error"] = cooldown
+        mock_client._exchange.fetch_balance.return_value = {"free": {"USDT": 0.0}}
+
+        gs = GridState(state_file=tmp_path / "grid_state.json")
+        rm = RiskManager(sample_config["risk"], sample_config["loop"])
+        pr = mocker.MagicMock(spec=PriceReader)
+        pr.get_current_price.return_value = 99999.0
+        pr.is_price_in_range.return_value = False
+        om = OrderManager(
+            client=mock_client,
+            risk_manager=rm,
+            grid_state=gs,
+            symbol=sample_config["grid"]["symbol"],
+            max_order_usdt=sample_config["grid"]["max_order_usdt"],
+        )
+        bot = BotLoop(
+            config=sample_config,
+            client=mock_client,
+            price_reader=pr,
+            risk_manager=rm,
+            grid_state=gs,
+            order_manager=om,
+        )
+        return bot
+
+    def test_cooldown_limita_llamadas_a_fetch_balance(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Con cooldown=10 y 6 ciclos, solo hay 2 llamadas a fetch_balance: init + ciclo 1.
+        El cooldown supera el número de ciclos, por lo que nunca se reintenta dentro de la ventana."""
+        bot = self._make_bot_out_of_range_no_usdt(
+            sample_config, mock_client, tmp_path, mocker, cooldown=10
+        )
+        bot.run(max_cycles=6)
+
+        # _initialize_grid (1) + primer intento fallido (1) = 2 llamadas totales.
+        # Los ciclos 2-6 omiten fetch_balance porque el cooldown (10) no expira antes.
+        assert mock_client._exchange.fetch_balance.call_count == 2
+
+    def test_cooldown_reintenta_despues_de_n_ciclos(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Con cooldown=2, el tercer ciclo vuelve a intentar el recentrado."""
+        bot = self._make_bot_out_of_range_no_usdt(
+            sample_config, mock_client, tmp_path, mocker, cooldown=2
+        )
+        # 4 ciclos: init(1) + ciclo1 falla(1) + ciclos2-3 cooldown + ciclo4 reintento(1)
+        bot.run(max_cycles=4)
+
+        assert mock_client._exchange.fetch_balance.call_count == 3
+
+    def test_sin_cooldown_reintenta_en_cada_ciclo(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Con cooldown=0, cada ciclo out-of-range intenta el recentrado (comportamiento anterior)."""
+        bot = self._make_bot_out_of_range_no_usdt(
+            sample_config, mock_client, tmp_path, mocker, cooldown=0
+        )
+        bot.run(max_cycles=3)
+
+        # init(1) + ciclo1(1) + ciclo2(1) + ciclo3(1) = 4 llamadas
+        assert mock_client._exchange.fetch_balance.call_count == 4
 
 
 # ------------------------------------------------------------------

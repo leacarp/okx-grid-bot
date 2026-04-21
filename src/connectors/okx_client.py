@@ -139,7 +139,19 @@ class OKXClient:
 
         if side not in ("buy", "sell"):
             raise ValueError(f"side inválido: {side!r}. Debe ser 'buy' o 'sell'.")
-        return self._exchange.create_order(symbol, "limit", side, amount, price)
+
+        try:
+            return self._exchange.create_order(symbol, "limit", side, amount, price)
+        except ccxt.InsufficientFunds as exc:
+            logger.warning(
+                "fondos_insuficientes | symbol=%s side=%s price=%.2f amount=%.8f error=%s",
+                symbol,
+                side,
+                price,
+                amount,
+                str(exc)[:120],
+            )
+            return None
 
     @_build_retry_decorator()
     def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any] | None:

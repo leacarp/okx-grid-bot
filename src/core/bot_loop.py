@@ -58,11 +58,18 @@ class BotLoop:
         self._original_range: float = self._grid_cfg["price_max"] - self._grid_cfg["price_min"]
         self._original_num_levels: int = self._grid_cfg["num_levels"]
         self._recenter_every_cycles: int = self._trailing_cfg.get("recenter_every_cycles", 200)
-        self._min_step_usdt: float = float(self._trailing_cfg.get("min_step_usdt", 750))
+        self._min_step_usdt: float = float(self._trailing_cfg.get("min_step_usdt", 600))
+        # Ciclos de espera tras un recentrado fallido antes de volver a intentarlo.
+        # Evita el loop infinito de reintentos cuando no hay USDT o hay error de red.
+        self._cooldown_cycles_after_error: int = int(
+            self._trailing_cfg.get("cooldown_cycles_after_error", 10)
+        )
+        self._recenter_cooldown_remaining: int = 0
         self._cycles_since_recenter: int = 0
 
         self._running = False
         self._total_cycles = 0
+        self._last_no_usdt_notification: float | None = None
 
         # Construcción de dependencias (inyectables para tests)
         if client is None:
@@ -103,14 +110,89 @@ class BotLoop:
     # Inicialización de la grilla
     # ------------------------------------------------------------------
 
+    def _cancel_orphan_orders(self) -> int:
+        """
+        Cancela todas las órdenes abiertas en el exchange para el símbolo.
+
+        Se llama antes de inicializar la grilla cuando no hay estado guardado,
+        para liberar el USDT que pudiera estar bloqueado en órdenes de una
+        sesión anterior cuyo estado se perdió (ej. redeploy sin volumen persistente).
+
+        Returns:
+            Número de órdenes canceladas.
+        """
+        if self._dry_run:
+            return 0
+
+        try:
+            open_orders = self._client.fetch_open_orders(self._symbol)
+            cancelled = 0
+            for order in open_orders:
+                order_id = order.get("id")
+                if order_id:
+                    self._client.cancel_order(order_id, self._symbol)
+                    cancelled += 1
+
+            if cancelled > 0:
+                logger.warning(
+                    "ordenes_huerfanas_canceladas",
+                    symbol=self._symbol,
+                    total=cancelled,
+                )
+                self._notifier.send(
+                    f"\u26a0\ufe0f {cancelled} orden(es) huérfana(s) canceladas al reiniciar\n"
+                    f"Símbolo: {self._symbol}\n"
+                    f"El estado previo se perdió — iniciando grilla desde cero."
+                )
+            return cancelled
+
+        except Exception as exc:
+            logger.warning(
+                "error_cancelando_ordenes_huerfanas",
+                error=str(exc),
+            )
+            return 0
+
     def _initialize_grid(self) -> bool:
         """
         Calcula niveles y coloca órdenes iniciales.
+
+        Secuencia:
+        1. Cancela órdenes huérfanas abiertas en el exchange (libera USDT).
+        2. Consulta el balance: USDT para BUYs, moneda base (ej. BTC) para SELLs.
+        3. Si hay moneda base disponible (BTC acumulado de sesiones anteriores),
+           coloca SELLs reales en niveles sobre el precio actual para retomar
+           la venta del capital ya invertido.
+        4. Coloca BUYs con el USDT disponible en niveles bajo el precio actual.
 
         Returns:
             True si la inicialización fue exitosa.
         """
         try:
+            self._cancel_orphan_orders()
+
+            # Consultar balance para detectar BTC disponible (SELLs) y USDT disponible (BUYs).
+            # Se hace siempre —incluso en DRY_RUN— porque fetch_balance es lectura pura
+            # y es la única forma de saber si hay BTC acumulado de sesiones anteriores.
+            base_available = 0.0
+            try:
+                balance = self._client.fetch_balance()
+                base_currency = self._symbol.split("/")[0]  # "BTC" de "BTC/USDT"
+                base_available = float(balance.get("free", {}).get(base_currency, 0.0))
+                if base_available > 0:
+                    logger.warning(
+                        "balance_base_detectado_al_iniciar",
+                        moneda=base_currency,
+                        disponible=round(base_available, 8),
+                    )
+                    self._notifier.send(
+                        f"\u26a0\ufe0f {base_currency} detectado al iniciar\n"
+                        f"Disponible: {base_available:.8f} {base_currency}\n"
+                        f"Se colocarán órdenes SELL encima del precio actual."
+                    )
+            except Exception as exc:
+                logger.warning("error_consultando_balance_al_iniciar", error=str(exc))
+
             calculator = GridCalculator(
                 price_min=self._price_min,
                 price_max=self._price_max,
@@ -121,7 +203,9 @@ class BotLoop:
             grid_levels = calculator.calculate()
 
             current_price = self._price_reader.get_current_price()
-            placed = self._order_manager.place_initial_orders(grid_levels, current_price)
+            placed = self._order_manager.place_initial_orders(
+                grid_levels, current_price, base_available=base_available
+            )
 
             logger.info(
                 "grid_inicializada",
@@ -147,6 +231,11 @@ class BotLoop:
         el mismo ancho total que el config original, ajusta num_levels para
         respetar min_step_usdt, y coloca las nuevas órdenes.
 
+        Antes de ejecutar el recentrado verifica que haya USDT disponible para
+        colocar al menos 1 orden nueva. Si todo el capital está en BTC comprado
+        (SELLs pendientes), postpone el recentrado para evitar gastar capital
+        inexistente.
+
         Args:
             current_price: Precio actual del mercado.
             reason: "out_of_range" | "cycles"
@@ -155,6 +244,53 @@ class BotLoop:
             True si el recentrado fue exitoso.
         """
         try:
+            min_order_usdt: float = self._risk_cfg.get("min_order_usdt", 0.5)
+            base_currency_rc = self._symbol.split("/")[0]
+
+            try:
+                balance = self._client.fetch_balance()
+                usdt_available: float = float(
+                    balance.get("free", {}).get("USDT", 0.0)
+                )
+                base_available_rc: float = float(
+                    balance.get("free", {}).get(base_currency_rc, 0.0)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "error_consultando_balance_para_recentrado",
+                    error=str(exc),
+                )
+                usdt_available = 0.0
+                base_available_rc = 0.0
+
+            if base_available_rc > 0:
+                logger.info(
+                    "btc_detectado_en_recentrado",
+                    moneda=base_currency_rc,
+                    disponible=round(base_available_rc, 8),
+                )
+
+            if usdt_available < min_order_usdt and base_available_rc == 0.0:
+                logger.warning(
+                    "recentrado_bloqueado_sin_usdt",
+                    usdt_disponible=round(usdt_available, 4),
+                    minimo_requerido=min_order_usdt,
+                    motivo=reason,
+                    precio=round(current_price, 2),
+                )
+                _now = time.time()
+                _throttle_seconds = 21600  # 6 horas
+                if (
+                    self._last_no_usdt_notification is None
+                    or _now - self._last_no_usdt_notification >= _throttle_seconds
+                ):
+                    self._notifier.notify_no_usdt_available(
+                        usdt_available=round(usdt_available, 4),
+                        required=min_order_usdt,
+                    )
+                    self._last_no_usdt_notification = _now
+                return False
+
             rango = self._original_range
             nuevo_min = current_price - rango / 2
             nuevo_max = current_price + rango / 2
@@ -183,8 +319,11 @@ class BotLoop:
             self._price_min = nuevo_min
             self._price_max = nuevo_max
 
-            placed = self._order_manager.place_initial_orders(new_levels, current_price)
+            placed = self._order_manager.place_initial_orders(
+                new_levels, current_price, base_available=base_available_rc
+            )
             self._cycles_since_recenter = 0
+            self._last_no_usdt_notification = None
 
             logger.info(
                 "grilla_recentrada",
@@ -230,6 +369,11 @@ class BotLoop:
             current_price = self._price_reader.get_current_price()
             self._cycles_since_recenter += 1
 
+            # El cooldown cuenta hacia atrás en cada ciclo, sin importar si el precio
+            # está en rango o no. Cuando llega a 0, se vuelve a intentar el recentrado.
+            if self._recenter_cooldown_remaining > 0:
+                self._recenter_cooldown_remaining -= 1
+
             # TRIGGER 1 — precio fuera de rango: recentrar inmediatamente
             in_range = self._price_reader.is_price_in_range(
                 current_price, self._price_min, self._price_max
@@ -241,7 +385,20 @@ class BotLoop:
                     price_min=round(self._price_min, 2),
                     price_max=round(self._price_max, 2),
                 )
-                self._recenter_grid(current_price, "out_of_range")
+                if self._recenter_cooldown_remaining > 0:
+                    logger.info(
+                        "recentrado_pospuesto_por_cooldown",
+                        ciclos_restantes=self._recenter_cooldown_remaining,
+                        motivo="out_of_range",
+                    )
+                else:
+                    success = self._recenter_grid(current_price, "out_of_range")
+                    if not success:
+                        self._recenter_cooldown_remaining = self._cooldown_cycles_after_error
+                        logger.warning(
+                            "recentrado_fallido_activando_cooldown",
+                            cooldown_ciclos=self._cooldown_cycles_after_error,
+                        )
                 self._total_cycles += 1
                 return True
 
@@ -253,7 +410,20 @@ class BotLoop:
                     recenter_every=self._recenter_every_cycles,
                     price=round(current_price, 2),
                 )
-                self._recenter_grid(current_price, "cycles")
+                if self._recenter_cooldown_remaining > 0:
+                    logger.info(
+                        "recentrado_pospuesto_por_cooldown",
+                        ciclos_restantes=self._recenter_cooldown_remaining,
+                        motivo="cycles",
+                    )
+                else:
+                    success = self._recenter_grid(current_price, "cycles")
+                    if not success:
+                        self._recenter_cooldown_remaining = self._cooldown_cycles_after_error
+                        logger.warning(
+                            "recentrado_fallido_activando_cooldown",
+                            cooldown_ciclos=self._cooldown_cycles_after_error,
+                        )
                 self._total_cycles += 1
                 return True
 

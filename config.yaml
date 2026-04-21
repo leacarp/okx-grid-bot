@@ -1,7 +1,7 @@
 grid:
   symbol: "BTC/USDT"
-  price_min: 71300
-  price_max: 74300
+  price_min: 72000
+  price_max: 75000
   num_levels: 6
   total_capital_usdt: 5.0
   max_order_usdt: 1
@@ -10,6 +10,8 @@ risk:
   max_daily_loss_usdt: 2.0
   max_open_orders: 10
   min_profit_per_trade_pct: 0.3
+  min_order_usdt: 0.5
+  min_order_btc: 0.00001  # Mínimo de OKX para BTC/USDT; SELLs con menos se omiten
 
 exchange:
   sandbox: false
@@ -21,6 +23,7 @@ loop:
 trailing:
   recenter_every_cycles: 1440
   min_step_usdt: 600
+  cooldown_cycles_after_error: 10  # Ciclos de espera tras recentrado fallido
 
 logging:
   level: "INFO"
