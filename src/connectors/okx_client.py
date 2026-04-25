@@ -101,6 +101,67 @@ class OKXClient:
         """Retorna el estado de una orden específica."""
         return self._exchange.fetch_order(order_id, symbol)
 
+    @_build_retry_decorator()
+    def fetch_order_trades(self, order_id: str, symbol: str) -> dict[str, Any]:
+        """
+        Retorna los trades ejecutados para una orden específica.
+
+        Agrega todos los fills parciales de la orden y retorna precio promedio
+        ponderado, cantidad total ejecutada y fee total pagada.
+
+        En DRY_RUN retorna un dict simulado con valores en cero.
+
+        Args:
+            order_id: ID de la orden en el exchange.
+            symbol: Par de trading (ej: "BTC/USDT").
+
+        Returns:
+            Dict con: order_id, symbol, price (promedio), amount (total),
+            fee (total), fee_currency.
+        """
+        if self.dry_run:
+            logger.info(
+                "fetch_order_trades_simulado | order_id=%s symbol=%s",
+                order_id,
+                symbol,
+            )
+            return {
+                "order_id": order_id,
+                "symbol": symbol,
+                "price": 0.0,
+                "amount": 0.0,
+                "fee": 0.0,
+                "fee_currency": "USDT",
+                "dry_run": True,
+            }
+
+        trades: list[dict[str, Any]] = self._exchange.fetch_order_trades(order_id, symbol)
+
+        if not trades:
+            return {
+                "order_id": order_id,
+                "symbol": symbol,
+                "price": 0.0,
+                "amount": 0.0,
+                "fee": 0.0,
+                "fee_currency": "USDT",
+            }
+
+        total_amount = sum(t.get("amount", 0.0) for t in trades)
+        total_cost = sum(t.get("cost", 0.0) for t in trades)
+        total_fee = sum(t.get("fee", {}).get("cost", 0.0) for t in trades)
+        fee_currency: str = trades[0].get("fee", {}).get("currency", "USDT")
+        avg_price = total_cost / total_amount if total_amount > 0 else 0.0
+
+        return {
+            "order_id": order_id,
+            "symbol": symbol,
+            "price": avg_price,
+            "amount": total_amount,
+            "fee": total_fee,
+            "fee_currency": fee_currency,
+        }
+
     # ------------------------------------------------------------------
     # Métodos de escritura (bloqueados en DRY_RUN)
     # ------------------------------------------------------------------
