@@ -6,12 +6,13 @@ Ejecuta ciclos de: lectura de precio → verificación de órdenes → reciclado
 """
 from __future__ import annotations
 
-import logging
 import signal
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from src.core.order_manager import OrderManager
+from src.core.pnl_tracker import PnLTracker
 from src.core.price_reader import PriceReader
 from src.risk.risk_manager import RiskManager
 from src.strategy.grid_calculator import GridCalculator
@@ -40,6 +41,7 @@ class BotLoop:
         grid_state: GridState | None = None,
         order_manager: OrderManager | None = None,
         notifier: TelegramNotifier | None = None,
+        pnl_tracker: PnLTracker | None = None,
     ) -> None:
         self._config = config
         self._grid_cfg = config["grid"]
@@ -70,6 +72,7 @@ class BotLoop:
         self._running = False
         self._total_cycles = 0
         self._last_no_usdt_notification: float | None = None
+        self._last_daily_report_date: str | None = None
 
         # Construcción de dependencias (inyectables para tests)
         if client is None:
@@ -83,6 +86,8 @@ class BotLoop:
         self._risk_manager = risk_manager or RiskManager(self._risk_cfg, self._loop_cfg)
         self._grid_state = grid_state or GridState()
 
+        self._pnl_tracker: PnLTracker = pnl_tracker or PnLTracker()
+
         if order_manager is None:
             order_manager = OrderManager(
                 client=self._client,
@@ -90,6 +95,7 @@ class BotLoop:
                 grid_state=self._grid_state,
                 symbol=self._symbol,
                 max_order_usdt=self._max_order_usdt,
+                pnl_tracker=self._pnl_tracker,
             )
         self._order_manager = order_manager
         self._notifier: TelegramNotifier = notifier or TelegramNotifier()
@@ -349,6 +355,81 @@ class BotLoop:
             return False
 
     # ------------------------------------------------------------------
+    # Reporte diario
+    # ------------------------------------------------------------------
+
+    def _send_daily_report(self) -> None:
+        """
+        Envía el resumen diario de PnL a Telegram una vez por día (00:00 UTC).
+
+        Se llama en cada ciclo; internamente verifica si ya se envió hoy.
+        El reporte incluye trades ganadores/perdedores, profit bruto, fees y neto.
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        if self._last_daily_report_date == today:
+            return
+
+        # Primer ciclo del día: calcular resumen del día ANTERIOR
+        # (today es el nuevo día; los ciclos de hoy aún no terminaron)
+        self._last_daily_report_date = today
+
+        summary = self._pnl_tracker.get_summary()
+        if summary.total_cycles == 0:
+            logger.info("reporte_diario_omitido", motivo="sin_ciclos_completados")
+            return
+
+        # Determinar trades ganadores y perdedores del día anterior
+        yesterday = None
+        try:
+            from datetime import timedelta
+            yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+        except Exception:
+            pass
+
+        winning = 0
+        losing = 0
+        daily_gross = 0.0
+        daily_fees = 0.0
+        daily_net = 0.0
+
+        for cycle in self._pnl_tracker._cycles:
+            cycle_date = cycle.completed_at[:10]  # YYYY-MM-DD
+            if cycle_date != yesterday:
+                continue
+            daily_gross += cycle.gross_profit
+            daily_fees += cycle.total_fees
+            daily_net += cycle.net_profit
+            if cycle.net_profit >= 0:
+                winning += 1
+            else:
+                losing += 1
+
+        if winning == 0 and losing == 0:
+            logger.info(
+                "reporte_diario_omitido",
+                motivo="sin_ciclos_completados_ayer",
+                fecha=yesterday,
+            )
+            return
+
+        logger.info(
+            "reporte_diario_enviado",
+            fecha=yesterday,
+            winning=winning,
+            losing=losing,
+            gross=round(daily_gross, 4),
+            fees=round(daily_fees, 4),
+            net=round(daily_net, 4),
+        )
+        self._notifier.notify_daily_summary(
+            winning_trades=winning,
+            losing_trades=losing,
+            gross_profit=round(daily_gross, 4),
+            total_fees=round(daily_fees, 4),
+            net_profit=round(daily_net, 4),
+        )
+
+    # ------------------------------------------------------------------
     # Ciclo principal
     # ------------------------------------------------------------------
 
@@ -366,6 +447,8 @@ class BotLoop:
             True si el ciclo fue exitoso, False si hubo error.
         """
         try:
+            self._send_daily_report()
+
             current_price = self._price_reader.get_current_price()
             self._cycles_since_recenter += 1
 

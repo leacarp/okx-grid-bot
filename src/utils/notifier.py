@@ -144,6 +144,32 @@ class TelegramNotifier:
             f"Mínimo requerido: ${required:,.4f}"
         )
 
+    def notify_daily_summary(
+        self,
+        winning_trades: int,
+        losing_trades: int,
+        gross_profit: float,
+        total_fees: float,
+        net_profit: float,
+    ) -> None:
+        """
+        Envía el resumen diario de PnL a Telegram (una vez al día a las 00:00 UTC).
+
+        Usa ⚠️ como encabezado si la ganancia neta es negativa.
+        """
+        header = "\u26a0\ufe0f" if net_profit < 0 else "\U0001f4ca"
+        profit_sign = "+" if net_profit >= 0 else ""
+        gross_sign = "+" if gross_profit >= 0 else ""
+
+        self.send(
+            f"{header} Resumen del día\n"
+            f"\u2705 Trades ganadores: {winning_trades}\n"
+            f"\u274c Trades perdedores: {losing_trades}\n"
+            f"\U0001f4b0 Profit bruto: {gross_sign}${gross_profit:.2f} USDT\n"
+            f"\U0001f4b8 Fees pagadas: -${total_fees:.2f} USDT\n"
+            f"\U0001f4c8 Ganancia neta: {profit_sign}${net_profit:.2f} USDT"
+        )
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------

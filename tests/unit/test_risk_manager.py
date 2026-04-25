@@ -3,6 +3,8 @@ Tests unitarios para RiskManager.
 """
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from src.risk.risk_manager import RiskManager
@@ -133,3 +135,141 @@ class TestCircuitBreaker:
         for i in range(1, 3):
             rm.register_error()
             assert rm.consecutive_errors == i
+
+    def test_circuit_por_errores_no_se_resetea_por_dia(self, rm):
+        """El reset diario no afecta circuits activados por errores consecutivos."""
+        rm.register_error()
+        rm.register_error()
+        rm.register_error()
+        assert rm.circuit_open is True
+        assert rm._circuit_reason == "consecutive_errors"
+
+        # Simular cambio de día
+        rm._last_reset_date = "2000-01-01"
+        rm._check_daily_reset()
+
+        assert rm.circuit_open is True  # sigue abierto
+
+
+class TestPreOrderCheck:
+    def test_ok_cuando_todo_valido(self, rm):
+        ok, reason = rm.pre_order_check(
+            order_size_usdt=1.0,
+            available_balance=5.0,
+            open_order_count=2,
+        )
+        assert ok is True
+        assert reason == "ok"
+
+    def test_falla_si_circuit_breaker_abierto(self, rm):
+        rm._circuit_open = True
+        ok, reason = rm.pre_order_check(1.0, available_balance=5.0, open_order_count=0)
+        assert ok is False
+        assert "circuit_breaker" in reason
+
+    def test_falla_si_balance_insuficiente(self, rm):
+        ok, reason = rm.pre_order_check(
+            order_size_usdt=10.0,
+            available_balance=1.0,
+            open_order_count=0,
+        )
+        assert ok is False
+        assert "balance_insuficiente" in reason
+
+    def test_falla_si_max_ordenes_alcanzado(self, rm):
+        ok, reason = rm.pre_order_check(
+            order_size_usdt=1.0,
+            available_balance=10.0,
+            open_order_count=5,  # igual al max_open_orders=5
+        )
+        assert ok is False
+        assert "max_ordenes_abiertas_alcanzado" in reason
+
+    def test_salta_check_balance_si_none(self, rm):
+        """Pasar available_balance=None omite la verificación de balance."""
+        ok, reason = rm.pre_order_check(
+            order_size_usdt=999.0,  # mayor que cualquier balance
+            available_balance=None,
+            open_order_count=0,
+        )
+        assert ok is True
+
+    def test_falla_si_orden_supera_max_configurado(self):
+        rm = RiskManager(
+            risk_config={"max_daily_loss_usdt": 2.0, "max_open_orders": 5, "max_order_usdt": 2.0},
+            loop_config={"max_consecutive_errors": 3},
+        )
+        ok, reason = rm.pre_order_check(
+            order_size_usdt=3.0,
+            available_balance=None,
+            open_order_count=0,
+        )
+        assert ok is False
+        assert "orden_excede_maximo" in reason
+
+    def test_integra_pnl_tracker_perdida_diaria_activa_circuit(self):
+        mock_tracker = MagicMock()
+        mock_tracker.get_daily_pnl.return_value = -3.0  # pérdida de $3
+
+        rm = RiskManager(
+            risk_config={"max_daily_loss_usdt": 2.0, "max_open_orders": 5},
+            loop_config={"max_consecutive_errors": 3},
+            pnl_tracker=mock_tracker,
+        )
+        ok, reason = rm.pre_order_check(1.0, available_balance=None, open_order_count=0)
+
+        assert ok is False
+        assert "perdida_diaria_excedida" in reason
+        assert rm.circuit_open is True
+        assert rm._circuit_reason == "daily_loss"
+
+    def test_integra_pnl_tracker_sin_perdida_pasa(self):
+        mock_tracker = MagicMock()
+        mock_tracker.get_daily_pnl.return_value = 0.5  # ganancia
+
+        rm = RiskManager(
+            risk_config={"max_daily_loss_usdt": 2.0, "max_open_orders": 5},
+            loop_config={"max_consecutive_errors": 3},
+            pnl_tracker=mock_tracker,
+        )
+        ok, _ = rm.pre_order_check(1.0, available_balance=None, open_order_count=0)
+        assert ok is True
+
+    def test_sin_pnl_tracker_omite_check_perdida(self, rm):
+        """Sin PnLTracker, no hay check de pérdida diaria."""
+        assert rm._pnl_tracker is None
+        ok, _ = rm.pre_order_check(1.0, available_balance=None, open_order_count=0)
+        assert ok is True
+
+
+class TestDailyReset:
+    def test_resetea_circuit_por_perdida_al_cambiar_de_dia(self, rm):
+        rm._circuit_open = True
+        rm._circuit_reason = "daily_loss"
+        rm._last_reset_date = "2000-01-01"
+
+        rm._check_daily_reset()
+
+        assert rm.circuit_open is False
+        assert rm._circuit_reason is None
+
+    def test_no_resetea_si_mismo_dia(self, rm):
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).date().isoformat()
+
+        rm._circuit_open = True
+        rm._circuit_reason = "daily_loss"
+        rm._last_reset_date = today
+
+        rm._check_daily_reset()
+
+        assert rm.circuit_open is True  # no reseteó porque ya es hoy
+
+    def test_no_resetea_circuit_por_errores_consecutivos(self, rm):
+        rm._circuit_open = True
+        rm._circuit_reason = "consecutive_errors"
+        rm._last_reset_date = "2000-01-01"
+
+        rm._check_daily_reset()
+
+        assert rm.circuit_open is True  # sigue abierto: no es daily_loss

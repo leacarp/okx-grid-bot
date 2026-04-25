@@ -7,16 +7,18 @@ La lógica de reciclado:
 """
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
+
+import structlog
 
 if TYPE_CHECKING:
     from src.connectors.okx_client import OKXClient
+    from src.core.pnl_tracker import PnLTracker
     from src.risk.risk_manager import RiskManager
     from src.strategy.grid_calculator import GridLevel
     from src.strategy.grid_state import GridState
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # OKX minimum order size for BTC/USDT (exchange hard limit)
 _MIN_ORDER_BTC = 0.00001
@@ -37,12 +39,14 @@ class OrderManager:
         grid_state: "GridState",
         symbol: str,
         max_order_usdt: float,
+        pnl_tracker: "PnLTracker | None" = None,
     ) -> None:
         self._client = client
         self._risk = risk_manager
         self._state = grid_state
         self._symbol = symbol
         self._max_order_usdt = max_order_usdt
+        self._pnl_tracker = pnl_tracker
 
     # ------------------------------------------------------------------
     # Colocación inicial
@@ -75,7 +79,7 @@ class OrderManager:
             Número de órdenes colocadas exitosamente (BUYs + SELLs).
         """
         if self._state.levels:
-            logger.info("ordenes_iniciales_omitidas | estado_existente_cargado")
+            logger.info("ordenes_iniciales_omitidas", motivo="estado_existente_cargado")
             return 0
 
         levels_data: list[dict[str, Any]] = []
@@ -88,30 +92,28 @@ class OrderManager:
         btc_remaining = base_available
 
         # Verificar que cada orden SELL supere el mínimo de OKX antes de intentar colocarlas.
-        # Con poco BTC dividido en muchos niveles, cada fracción puede quedar por debajo de
-        # 0.00001 BTC (~$0.76 a $76k) y OKX rechazaría la orden.
         if btc_per_sell > 0 and btc_per_sell < _MIN_ORDER_BTC:
             valor_aprox_usdt = btc_per_sell * current_price
             logger.warning(
-                "btc_por_nivel_debajo_del_minimo_okx | skip_sells "
-                "btc_por_nivel=%.8f min_btc=%.5f valor_aprox=$%.4f "
-                "total_btc=%.8f niveles_sell=%d",
-                btc_per_sell,
-                _MIN_ORDER_BTC,
-                valor_aprox_usdt,
-                base_available,
-                len(sell_levels),
+                "btc_por_nivel_debajo_del_minimo_okx",
+                btc_por_nivel=round(btc_per_sell, 8),
+                min_btc=_MIN_ORDER_BTC,
+                valor_aprox_usdt=round(valor_aprox_usdt, 4),
+                total_btc=round(base_available, 8),
+                niveles_sell=len(sell_levels),
             )
             btc_per_sell = 0.0
             btc_remaining = 0.0
 
         if btc_per_sell > 0:
             logger.info(
-                "btc_disponible_para_sells | amount=%.8f niveles_sell=%d btc_por_nivel=%.8f",
-                base_available,
-                len(sell_levels),
-                btc_per_sell,
+                "btc_disponible_para_sells",
+                amount=round(base_available, 8),
+                niveles_sell=len(sell_levels),
+                btc_por_nivel=round(btc_per_sell, 8),
             )
+
+        open_count = 0  # contador de órdenes abiertas durante la inicialización
 
         for level in grid_levels:
             if level.price >= current_price:
@@ -128,33 +130,36 @@ class OrderManager:
                         levels_data.append(entry)
                         btc_remaining -= btc_per_sell
                         placed_sells += 1
+                        open_count += 1
                         logger.info(
-                            "orden_inicial_colocada | symbol=%s side=sell price=%.2f "
-                            "amount=%.8f order_id=%s",
-                            self._symbol,
-                            level.price,
-                            btc_per_sell,
-                            order["id"],
+                            "orden_inicial_colocada",
+                            symbol=self._symbol,
+                            side="sell",
+                            price=level.price,
+                            amount=round(btc_per_sell, 8),
+                            order_id=order["id"],
                         )
                         continue
 
                 # No hay BTC disponible o la orden falló → marcar como sell_pending
                 levels_data.append(self._level_dict(level, "sell", "sell_pending", None))
                 logger.debug(
-                    "nivel_reservado_para_sell | price=%.2f index=%d",
-                    level.price,
-                    level.index,
+                    "nivel_reservado_para_sell",
+                    price=level.price,
+                    index=level.index,
                 )
                 continue
 
-            ok, reason = self._risk.can_place_order(
-                level.order_size_quote, self._max_order_usdt
+            ok, reason = self._risk.pre_order_check(
+                order_size_usdt=level.order_size_quote,
+                available_balance=None,
+                open_order_count=open_count,
             )
             if not ok:
                 logger.warning(
-                    "orden_bloqueada_por_riesgo | reason=%s level=%d",
-                    reason,
-                    level.index,
+                    "orden_bloqueada_por_riesgo",
+                    reason=reason,
+                    level=level.index,
                 )
                 levels_data.append(self._level_dict(level, "buy", "blocked", None))
                 continue
@@ -171,13 +176,14 @@ class OrderManager:
                     self._level_dict(level, "buy", "buy_open", order["id"])
                 )
                 placed_buys += 1
+                open_count += 1
                 logger.info(
-                    "orden_inicial_colocada | symbol=%s side=buy price=%.2f "
-                    "amount=%.8f order_id=%s",
-                    self._symbol,
-                    level.price,
-                    level.order_size_base,
-                    order["id"],
+                    "orden_inicial_colocada",
+                    symbol=self._symbol,
+                    side="buy",
+                    price=level.price,
+                    amount=round(level.order_size_base, 8),
+                    order_id=order["id"],
                 )
             else:
                 levels_data.append(self._level_dict(level, "buy", "error", None))
@@ -194,12 +200,11 @@ class OrderManager:
         )
 
         logger.info(
-            "ordenes_iniciales_completas | buy_colocadas=%d sell_colocadas=%d "
-            "sell_pendientes=%d total=%d",
-            placed_buys,
-            placed_sells,
-            sum(1 for l in levels_data if l["status"] == "sell_pending"),
-            len(grid_levels),
+            "ordenes_iniciales_completas",
+            buy_colocadas=placed_buys,
+            sell_colocadas=placed_sells,
+            sell_pendientes=sum(1 for l in levels_data if l["status"] == "sell_pending"),
+            total=len(grid_levels),
         )
         return placed_buys + placed_sells
 
@@ -240,33 +245,35 @@ class OrderManager:
 
                 if side == "buy" and current_price <= order_price:
                     logger.info(
-                        "cruce_detectado | side=buy order_price=%.2f current_price=%.2f "
-                        "→ FILLED (precio bajo hasta el nivel de compra)",
-                        order_price,
-                        current_price,
+                        "cruce_detectado",
+                        side="buy",
+                        order_price=order_price,
+                        current_price=current_price,
+                        resultado="FILLED",
                     )
                     filled.append(level)
                 elif side == "sell" and current_price >= order_price:
                     logger.info(
-                        "cruce_detectado | side=sell order_price=%.2f current_price=%.2f "
-                        "→ FILLED (precio subió hasta el nivel de venta)",
-                        order_price,
-                        current_price,
+                        "cruce_detectado",
+                        side="sell",
+                        order_price=order_price,
+                        current_price=current_price,
+                        resultado="FILLED",
                     )
                     filled.append(level)
                 else:
                     logger.debug(
-                        "sin_cruce | side=%s order_price=%.2f current_price=%.2f",
-                        side,
-                        order_price,
-                        current_price,
+                        "sin_cruce",
+                        side=side,
+                        order_price=order_price,
+                        current_price=current_price,
                     )
 
             if filled:
                 logger.info(
-                    "ordenes_simuladas_ejecutadas | count=%d current_price=%.2f",
-                    len(filled),
-                    current_price,
+                    "ordenes_simuladas_ejecutadas",
+                    count=len(filled),
+                    current_price=current_price,
                 )
             return filled
 
@@ -282,7 +289,7 @@ class OrderManager:
                 filled.append(level)
 
         if filled:
-            logger.info("ordenes_ejecutadas_detectadas | count=%d", len(filled))
+            logger.info("ordenes_ejecutadas_detectadas", count=len(filled))
         return filled
 
     # ------------------------------------------------------------------
@@ -294,7 +301,7 @@ class OrderManager:
         Recicla una orden ejecutada colocando la orden opuesta en el nivel adyacente.
 
         BUY en N ejecutada  → SELL en N+1
-        SELL en N ejecutada → BUY en N-1
+        SELL en N ejecutada → BUY en N-1 (y registra el ciclo en PnLTracker)
 
         Returns:
             La nueva orden colocada, o None si no fue posible.
@@ -310,21 +317,40 @@ class OrderManager:
             target_index = index - 1
             new_side = "buy"
         else:
-            logger.warning("reciclar_orden_side_invalido | side=%s index=%d", side, index)
+            logger.warning("reciclar_orden_side_invalido", side=side, index=index)
             return None
 
         target_levels = [l for l in self._state.levels if l["index"] == target_index]
         if not target_levels:
             logger.warning(
-                "reciclar_orden_sin_nivel_objetivo | index=%d side=%s target=%d",
-                index,
-                side,
-                target_index,
+                "reciclar_orden_sin_nivel_objetivo",
+                index=index,
+                side=side,
+                target=target_index,
             )
             return None
 
         target_level = target_levels[0]
         new_price: float = target_level["price"]
+
+        # Verificar risk antes de colocar la nueva orden
+        open_count = sum(
+            1 for l in self._state.levels
+            if l.get("status", "").endswith("_open") and l["index"] != index
+        )
+        ok, reason = self._risk.pre_order_check(
+            order_size_usdt=amount * new_price,
+            available_balance=None,
+            open_order_count=open_count,
+        )
+        if not ok:
+            logger.warning(
+                "orden_reciclada_bloqueada_por_riesgo",
+                reason=reason,
+                side=new_side,
+                target_index=target_index,
+            )
+            return None
 
         order = self._client.create_limit_order(
             symbol=self._symbol,
@@ -336,19 +362,53 @@ class OrderManager:
         if order:
             self._state.update_level(target_index, f"{new_side}_open", order["id"])
             self._state.update_level(index, f"{side}_filled")
+
+            # Cuando SELL se ejecuta → ciclo completo (BUY anterior + esta SELL)
+            # El precio del BUY original es el mismo que el del nuevo BUY a colocar (target)
+            if side == "sell" and self._pnl_tracker is not None:
+                buy_price = new_price               # price del nivel target (donde va el nuevo BUY)
+                sell_price = filled_level["price"]  # price de la SELL que acaba de llenar
+
+                buy_fill = self._pnl_tracker.record_fill(
+                    order_id=f"buy_{target_index}",
+                    symbol=self._symbol,
+                    side="buy",
+                    amount=amount,
+                    price=buy_price,
+                    fee=0.0,
+                )
+                sell_fill = self._pnl_tracker.record_fill(
+                    order_id=filled_level.get("order_id") or f"sell_{index}",
+                    symbol=self._symbol,
+                    side="sell",
+                    amount=amount,
+                    price=sell_price,
+                    fee=0.0,
+                )
+                cycle = self._pnl_tracker.record_cycle(buy_fill, sell_fill)
+                self._state.record_profit(cycle.net_profit)
+                logger.info(
+                    "ciclo_completado_pnl",
+                    symbol=self._symbol,
+                    buy_price=buy_price,
+                    sell_price=sell_price,
+                    net_profit=cycle.net_profit,
+                )
+
             logger.info(
-                "orden_reciclada | filled_side=%s filled_index=%d "
-                "new_side=%s new_price=%.2f new_order_id=%s",
-                side,
-                index,
-                new_side,
-                new_price,
-                order["id"],
+                "orden_reciclada",
+                filled_side=side,
+                filled_index=index,
+                new_side=new_side,
+                new_price=new_price,
+                new_order_id=order["id"],
             )
             return order
 
         logger.error(
-            "reciclar_orden_fallida | side=%s index=%d", new_side, target_index
+            "reciclar_orden_fallida",
+            side=new_side,
+            target_index=target_index,
         )
         return None
 
@@ -375,7 +435,7 @@ class OrderManager:
         if cancelled > 0:
             self._state.save()
 
-        logger.info("ordenes_canceladas | total=%d", cancelled)
+        logger.info("ordenes_canceladas", total=cancelled)
         return cancelled
 
     # ------------------------------------------------------------------

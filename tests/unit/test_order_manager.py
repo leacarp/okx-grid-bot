@@ -3,10 +3,14 @@ Tests unitarios para OrderManager.
 """
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import MagicMock
+
 import pytest
 import ccxt
 
 from src.core.order_manager import OrderManager
+from src.core.pnl_tracker import PnLTracker
 from src.risk.risk_manager import RiskManager
 from src.strategy.grid_calculator import GridCalculator
 from src.strategy.grid_state import GridState
@@ -16,7 +20,7 @@ from src.strategy.grid_state import GridState
 # Helpers
 # ------------------------------------------------------------------
 
-def make_order_manager(mock_client, grid_state, risk_manager=None):
+def make_order_manager(mock_client, grid_state, risk_manager=None, pnl_tracker=None):
     if risk_manager is None:
         risk_manager = RiskManager(
             risk_config={"max_daily_loss_usdt": 2.0, "max_open_orders": 10},
@@ -28,6 +32,7 @@ def make_order_manager(mock_client, grid_state, risk_manager=None):
         grid_state=grid_state,
         symbol="BTC/USDT",
         max_order_usdt=2.5,
+        pnl_tracker=pnl_tracker,
     )
 
 
@@ -433,3 +438,97 @@ class TestCancelAllOrders:
 
         level = grid_state.levels[0]
         assert level["status"] == "cancelled"
+
+
+# ------------------------------------------------------------------
+# Tests de integración con PnLTracker
+# ------------------------------------------------------------------
+
+class TestPnLTrackerIntegracion:
+    def _setup_two_levels(self, grid_state):
+        grid_state.initialize(
+            "BTC/USDT",
+            {"price_min": 60000, "price_max": 63750, "num_levels": 2},
+            [
+                {"index": 0, "price": 60000.0, "status": "buy_open",
+                 "order_id": "buy_0", "side": "buy", "amount": 0.00003},
+                {"index": 1, "price": 63750.0, "status": "sell_open",
+                 "order_id": "sell_1", "side": "sell", "amount": 0.00003},
+            ],
+        )
+
+    def test_reciclar_sell_registra_ciclo_en_pnl_tracker(self, mock_client, grid_state, tmp_path):
+        tracker = PnLTracker(history_file=tmp_path / "hist.json")
+        om = make_order_manager(mock_client, grid_state, pnl_tracker=tracker)
+        self._setup_two_levels(grid_state)
+
+        # SELL en index=1 se ejecuta → ciclo completo con BUY en index=0
+        filled_sell = grid_state.levels[1]
+        om.recycle_order(filled_sell)
+
+        summary = tracker.get_summary()
+        assert summary.total_cycles == 1
+        assert summary.gross_profit > 0  # 63750 > 60000
+
+    def test_reciclar_buy_no_registra_ciclo(self, mock_client, grid_state, tmp_path):
+        tracker = PnLTracker(history_file=tmp_path / "hist.json")
+        om = make_order_manager(mock_client, grid_state, pnl_tracker=tracker)
+        self._setup_two_levels(grid_state)
+
+        # BUY en index=0 se ejecuta → coloca SELL, pero el ciclo no está completo
+        filled_buy = grid_state.levels[0]
+        om.recycle_order(filled_buy)
+
+        summary = tracker.get_summary()
+        assert summary.total_cycles == 0  # sin ciclo completado
+
+    def test_reciclar_sell_actualiza_grid_state_profit(self, mock_client, grid_state, tmp_path):
+        tracker = PnLTracker(history_file=tmp_path / "hist.json")
+        om = make_order_manager(mock_client, grid_state, pnl_tracker=tracker)
+        self._setup_two_levels(grid_state)
+
+        filled_sell = grid_state.levels[1]
+        om.recycle_order(filled_sell)
+
+        # grid_state.record_profit fue llamado → total_profit > 0
+        assert grid_state.total_profit > 0
+
+    def test_sin_pnl_tracker_reciclar_funciona_igual(self, mock_client, grid_state):
+        """Sin PnLTracker el reciclado sigue funcionando sin errores."""
+        om = make_order_manager(mock_client, grid_state, pnl_tracker=None)
+        self._setup_two_levels(grid_state)
+
+        filled_sell = grid_state.levels[1]
+        result = om.recycle_order(filled_sell)
+
+        assert result is not None  # la orden se recicló correctamente
+
+
+# ------------------------------------------------------------------
+# Tests de pre_order_check cableado en recycle_order
+# ------------------------------------------------------------------
+
+class TestPreOrderCheckEnRecycle:
+    def test_circuit_breaker_bloquea_reciclar(self, mock_client, grid_state):
+        risk = RiskManager(
+            risk_config={"max_daily_loss_usdt": 2.0, "max_open_orders": 10},
+            loop_config={"max_consecutive_errors": 5},
+        )
+        risk._circuit_open = True
+
+        om = make_order_manager(mock_client, grid_state, risk_manager=risk)
+        grid_state.initialize(
+            "BTC/USDT",
+            {"price_min": 60000, "price_max": 63750, "num_levels": 2},
+            [
+                {"index": 0, "price": 60000.0, "status": "buy_open",
+                 "order_id": "buy_0", "side": "buy", "amount": 0.00003},
+                {"index": 1, "price": 63750.0, "status": "sell_open",
+                 "order_id": "sell_1", "side": "sell", "amount": 0.00003},
+            ],
+        )
+
+        filled_sell = grid_state.levels[1]
+        result = om.recycle_order(filled_sell)
+
+        assert result is None  # bloqueado por circuit breaker
