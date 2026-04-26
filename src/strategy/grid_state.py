@@ -19,6 +19,22 @@ logger = logging.getLogger(__name__)
 DEFAULT_STATE_FILE = Path("data/grid_state.json")
 
 
+def state_file_for_symbol(symbol: str) -> Path:
+    """
+    Retorna el path del archivo de estado para un símbolo dado.
+
+    Convierte el símbolo en un nombre de archivo seguro reemplazando '/' por '_'.
+
+    Args:
+        symbol: Par de trading, ej: "BTC/USDT"
+
+    Returns:
+        Path como data/grid_state_BTC_USDT.json
+    """
+    safe_name = symbol.replace("/", "_").replace("-", "_")
+    return Path(f"data/grid_state_{safe_name}.json")
+
+
 class GridState:
     """
     Persiste y gestiona el estado de la grilla.

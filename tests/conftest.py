@@ -135,3 +135,40 @@ def risk_manager(sample_config) -> RiskManager:
 @pytest.fixture
 def grid_state(tmp_path) -> GridState:
     return GridState(state_file=tmp_path / "grid_state.json")
+
+
+# ------------------------------------------------------------------
+# Config multi-token (nueva estructura Fase 2)
+# ------------------------------------------------------------------
+
+@pytest.fixture
+def sample_config_multitoken() -> dict:
+    return {
+        "tokens": [
+            {"symbol": "BTC/USDT", "num_levels": 6, "min_step_usdt": 600},
+            {"symbol": "ETH/USDT", "num_levels": 6, "min_step_usdt": 30},
+            {"symbol": "SOL/USDT", "num_levels": 6, "min_step_usdt": 3},
+        ],
+        "grid": {
+            "total_capital_usdt": 5.0,
+            "max_order_usdt": 1.0,
+            "range_width_pct": 5.0,
+        },
+        "risk": {
+            "max_daily_loss_usdt": 2.0,
+            "max_open_orders": 10,
+            "min_profit_per_trade_pct": 0.3,
+            "min_order_usdt": 0.5,
+        },
+        "exchange": {"sandbox": False},
+        "loop": {
+            "interval_seconds": 5,
+            "max_consecutive_errors": 5,
+        },
+        "trailing": {
+            "recenter_every_cycles": 1440,
+            "cooldown_cycles_after_error": 10,
+        },
+        "logging": {"level": "DEBUG"},
+        "dry_run": True,
+    }

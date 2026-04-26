@@ -1,13 +1,14 @@
 """
-Tests unitarios para GridState.
+Tests unitarios para GridState y state_file_for_symbol.
 """
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
-from src.strategy.grid_state import GridState
+from src.strategy.grid_state import GridState, state_file_for_symbol
 
 
 SAMPLE_LEVELS = [
@@ -122,3 +123,54 @@ class TestGridStatePropiedades:
 
     def test_levels_vacio_antes_de_initialize(self, grid_state):
         assert grid_state.levels == []
+
+
+class TestStateFileForSymbol:
+    def test_btc_usdt(self):
+        path = state_file_for_symbol("BTC/USDT")
+        assert path == Path("data/grid_state_BTC_USDT.json")
+
+    def test_eth_usdt(self):
+        path = state_file_for_symbol("ETH/USDT")
+        assert path == Path("data/grid_state_ETH_USDT.json")
+
+    def test_sol_usdt(self):
+        path = state_file_for_symbol("SOL/USDT")
+        assert path == Path("data/grid_state_SOL_USDT.json")
+
+    def test_slash_reemplazado_por_guion_bajo(self):
+        path = state_file_for_symbol("BTC/USDT")
+        assert "/" not in path.name
+
+    def test_guion_reemplazado_por_guion_bajo(self):
+        path = state_file_for_symbol("BTC-USDT")
+        assert path == Path("data/grid_state_BTC_USDT.json")
+
+    def test_retorna_path_object(self):
+        path = state_file_for_symbol("BTC/USDT")
+        assert isinstance(path, Path)
+
+    def test_directorio_es_data(self):
+        path = state_file_for_symbol("ETH/USDT")
+        assert path.parent == Path("data")
+
+    def test_extension_es_json(self):
+        path = state_file_for_symbol("SOL/USDT")
+        assert path.suffix == ".json"
+
+    def test_simbolos_distintos_generan_paths_distintos(self):
+        btc = state_file_for_symbol("BTC/USDT")
+        eth = state_file_for_symbol("ETH/USDT")
+        sol = state_file_for_symbol("SOL/USDT")
+        assert btc != eth
+        assert eth != sol
+        assert btc != sol
+
+    def test_grid_state_usa_path_correcto(self, tmp_path):
+        """GridState construido con state_file_for_symbol usa el path esperado."""
+        symbol = "ETH/USDT"
+        expected_name = "grid_state_ETH_USDT.json"
+        gs = GridState(state_file=tmp_path / expected_name)
+        gs.initialize(symbol, SAMPLE_GRID_CONFIG, SAMPLE_LEVELS)
+        assert gs._path.name == expected_name
+        assert gs._path.exists()
