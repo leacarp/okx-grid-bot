@@ -102,6 +102,29 @@ class OKXClient:
         return self._exchange.fetch_order(order_id, symbol)
 
     @_build_retry_decorator()
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1h",
+        limit: int = 24,
+    ) -> list[list[float]]:
+        """
+        Retorna velas OHLCV para el símbolo dado.
+
+        Cada vela es una lista con:
+            [timestamp_ms, open, high, low, close, volume]
+
+        Args:
+            symbol: Par de trading (ej: "BTC/USDT").
+            timeframe: Intervalo temporal (ej: "1h", "4h", "1d").
+            limit: Número máximo de velas a retornar.
+
+        Returns:
+            Lista de velas ordenadas de más antigua a más reciente.
+        """
+        return self._exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+    @_build_retry_decorator()
     def fetch_order_trades(self, order_id: str, symbol: str) -> dict[str, Any]:
         """
         Retorna los trades ejecutados para una orden específica.
