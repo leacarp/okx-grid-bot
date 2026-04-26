@@ -587,6 +587,95 @@ class TestBotLoopRecenterCooldown:
 
 
 # ------------------------------------------------------------------
+# Tests de reporte semanal
+# ------------------------------------------------------------------
+
+class TestBotLoopReporteSemanal:
+    """Verifica que _send_weekly_report se dispara correctamente los domingos."""
+
+    def _make_bot_with_notifier(self, sample_config, mock_client, tmp_path, mocker):
+        """Retorna (bot, mock_notifier) con notifier inyectado."""
+        from src.utils.notifier import TelegramNotifier
+
+        mocker.patch(_SLEEP_PATH)
+        gs = GridState(state_file=tmp_path / "grid_state.json")
+        rm = RiskManager(sample_config["risk"], sample_config["loop"])
+        pr = mocker.MagicMock(spec=PriceReader)
+        pr.get_current_price.return_value = 67500.0
+        pr.is_price_in_range.return_value = True
+        om = OrderManager(
+            client=mock_client,
+            risk_manager=rm,
+            grid_state=gs,
+            symbol="BTC/USDT",
+            max_order_usdt=2.5,
+        )
+        mock_notifier = mocker.MagicMock(spec=TelegramNotifier)
+        bot = BotLoop(
+            config=sample_config,
+            client=mock_client,
+            price_reader=pr,
+            risk_manager=rm,
+            grid_state=gs,
+            order_manager=om,
+            notifier=mock_notifier,
+        )
+        return bot, mock_notifier
+
+    def test_no_envia_reporte_si_no_es_domingo(self, sample_config, mock_client, tmp_path, mocker):
+        """Si hoy no es domingo, no se envía el reporte semanal."""
+        from datetime import datetime, timezone
+
+        bot, mock_notifier = self._make_bot_with_notifier(
+            sample_config, mock_client, tmp_path, mocker
+        )
+        # Simular un martes (isoweekday=2)
+        fake_now = datetime(2026, 4, 21, 0, 0, 0, tzinfo=timezone.utc)  # martes
+        mocker.patch("src.core.bot_loop.datetime", wraps=datetime)
+        mocker.patch("src.core.bot_loop.datetime").now.return_value = fake_now
+
+        bot.run(max_cycles=1)
+        mock_notifier.notify_weekly_summary.assert_not_called()
+
+    def test_no_envia_reporte_si_ya_se_envio_esta_semana(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Si el reporte ya fue enviado esta semana, no se reenvía."""
+        from datetime import datetime, timezone
+
+        bot, mock_notifier = self._make_bot_with_notifier(
+            sample_config, mock_client, tmp_path, mocker
+        )
+        # Simular domingo (isoweekday=7)
+        fake_now = datetime(2026, 4, 26, 0, 30, 0, tzinfo=timezone.utc)  # domingo
+        mocker.patch("src.core.bot_loop.datetime").now.return_value = fake_now
+
+        # Marcar como ya enviado esta semana
+        bot._last_weekly_report_week = fake_now.strftime("%Y-W%W")
+        bot.run(max_cycles=1)
+
+        mock_notifier.notify_weekly_summary.assert_not_called()
+
+    def test_no_envia_reporte_semanal_sin_ciclos(
+        self, sample_config, mock_client, tmp_path, mocker
+    ):
+        """Si no hay ciclos en la semana, no se llama notify_weekly_summary."""
+        from datetime import datetime, timezone
+
+        bot, mock_notifier = self._make_bot_with_notifier(
+            sample_config, mock_client, tmp_path, mocker
+        )
+        # Simular domingo sin ciclos en pnl_tracker
+        fake_now = datetime(2026, 4, 26, 0, 0, 0, tzinfo=timezone.utc)  # domingo
+        mocker.patch("src.core.bot_loop.datetime").now.return_value = fake_now
+
+        # _pnl_tracker está vacío por defecto
+        bot.run(max_cycles=1)
+
+        mock_notifier.notify_weekly_summary.assert_not_called()
+
+
+# ------------------------------------------------------------------
 # Tests de propiedades
 # ------------------------------------------------------------------
 

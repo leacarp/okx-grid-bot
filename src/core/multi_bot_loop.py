@@ -27,6 +27,8 @@ from src.utils.notifier import TelegramNotifier
 
 if TYPE_CHECKING:
     from src.connectors.okx_client import OKXClient
+    from src.strategy.market_analyzer import MarketAnalyzer
+    from src.strategy.pair_selector import PairSelector
 
 logger = get_logger("multi_bot_loop")
 
@@ -47,22 +49,29 @@ class MultiBotLoop:
         client: "OKXClient | None" = None,
         notifier: TelegramNotifier | None = None,
         pnl_tracker: PnLTracker | None = None,
+        market_analyzer: "MarketAnalyzer | None" = None,
+        pair_selector: "PairSelector | None" = None,
     ) -> None:
         self._config = config
         self._tokens: list[dict[str, Any]] = config["tokens"]
         self._grid_cfg: dict[str, Any] = config["grid"]
         self._risk_cfg: dict[str, Any] = config["risk"]
         self._loop_cfg: dict[str, Any] = config["loop"]
+        self._market_analysis_cfg: dict[str, Any] = config.get("market_analysis", {})
         self._dry_run: bool = config.get("dry_run", True)
         self._interval: float = float(self._loop_cfg["interval_seconds"])
         self._pair_cooldown: float = float(
             config.get("multi", {}).get("pair_cooldown_seconds", PAIR_COOLDOWN_SECONDS)
+        )
+        self._pair_eval_every_cycles: int = int(
+            self._market_analysis_cfg.get("pair_eval_every_cycles", 10)
         )
 
         self._current_idx: int = 0
         self._last_switch_time: float = 0.0
         self._running: bool = False
         self._total_cycles: int = 0
+        self._cycles_since_pair_eval: int = 0
 
         # Componentes del token activo (asignados en _initialize_token)
         self._current_symbol: str | None = None
@@ -83,6 +92,8 @@ class MultiBotLoop:
         self._notifier: TelegramNotifier = notifier or TelegramNotifier()
         self._pnl_tracker: PnLTracker = pnl_tracker or PnLTracker()
         self._risk_manager = RiskManager(self._risk_cfg, self._loop_cfg)
+        self._market_analyzer: "MarketAnalyzer | None" = market_analyzer
+        self._pair_selector: "PairSelector | None" = pair_selector
 
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -275,6 +286,152 @@ class MultiBotLoop:
         """Retorna True si transcurrió el cooldown mínimo desde el último cambio de par."""
         return (time.time() - self._last_switch_time) >= self._pair_cooldown
 
+    def _switch_to_symbol(self, symbol: str) -> bool:
+        """
+        Cambia el par activo a uno específico (para PairSelector).
+
+        Misma lógica de atomicidad que _switch_to_next, pero recibe el símbolo destino
+        en lugar de rotar en round-robin.
+
+        Args:
+            symbol: Par destino (debe existir en config["tokens"]).
+
+        Returns:
+            True si el cambio fue exitoso.
+        """
+        token_cfg = next((t for t in self._tokens if t["symbol"] == symbol), None)
+        if token_cfg is None:
+            logger.error("switch_to_symbol_simbolo_no_encontrado", symbol=symbol)
+            return False
+
+        next_idx = self._tokens.index(token_cfg)
+        prev_symbol = self._current_symbol
+        prev_idx = self._current_idx
+
+        # Pre-flight: verificar precio del nuevo símbolo sin cancelar el actual
+        _, _, next_pr = self._build_components(symbol)
+        try:
+            next_pr.get_current_price()
+        except Exception as exc:
+            logger.error(
+                "switch_to_symbol_abortado_sin_precio",
+                siguiente=symbol,
+                error=str(exc),
+            )
+            return False
+
+        logger.info(
+            "switch_to_symbol_iniciando",
+            actual=prev_symbol,
+            siguiente=symbol,
+        )
+
+        if self._current_order_manager:
+            self._current_order_manager.cancel_all_orders()
+        if self._current_grid_state:
+            self._current_grid_state.save()
+
+        self._current_idx = next_idx
+        success = self._initialize_token(token_cfg)
+
+        if not success:
+            logger.error(
+                "switch_to_symbol_fallido_recuperando",
+                fallido=symbol,
+                recuperando=prev_symbol,
+            )
+            self._current_idx = prev_idx
+            recovery = self._initialize_token(self._tokens[prev_idx])
+            if not recovery:
+                logger.critical(
+                    "recuperacion_fallida_tras_switch_to_symbol",
+                    token=prev_symbol,
+                )
+            return False
+
+        self._last_switch_time = time.time()
+        logger.info(
+            "switch_to_symbol_exitoso",
+            anterior=prev_symbol,
+            actual=self._current_symbol,
+        )
+        return True
+
+    def _evaluate_and_maybe_switch(self) -> None:
+        """
+        Re-evalúa el par óptimo con MarketAnalyzer + PairSelector.
+
+        Se llama cada `pair_eval_every_cycles` ciclos. Si PairSelector indica
+        un par diferente al actual, ejecuta el cambio. Si ningún par es apto,
+        loggea un warning y mantiene el actual.
+        """
+        if self._market_analyzer is None or self._pair_selector is None:
+            return
+
+        symbols = [t["symbol"] for t in self._tokens]
+        analyses = []
+        for sym in symbols:
+            try:
+                analysis = self._market_analyzer.analyze(sym)
+                analyses.append(analysis)
+            except Exception as exc:
+                logger.warning(
+                    "pair_eval_error_analizando",
+                    symbol=sym,
+                    error=str(exc),
+                )
+
+        if not analyses:
+            logger.warning("pair_eval_sin_analisis_disponibles")
+            return
+
+        selection = self._pair_selector.select_best_pair(analyses)
+
+        if selection is None:
+            # Ningún par superó min_score_to_trade
+            logger.warning(
+                "pair_eval_ninguno_apto_mantiene_actual",
+                actual=self._current_symbol,
+            )
+            # Buscar el mejor score disponible para el mensaje
+            min_score = float(
+                self._market_analysis_cfg.get("min_score_to_trade", 0.30)
+            )
+            if analyses:
+                best_a = max(analyses, key=lambda a: a.score)
+                self._notifier.notify_no_suitable_pair(
+                    best_symbol=best_a.symbol,
+                    best_score=round(best_a.score, 4),
+                    min_score=min_score,
+                )
+            return
+
+        if selection.symbol != self._current_symbol:
+            logger.info(
+                "pair_eval_cambiando_par",
+                anterior=self._current_symbol,
+                nuevo=selection.symbol,
+                score=round(selection.score, 4),
+                regime=selection.regime.regime,
+                atr_pct=round(selection.regime.atr_pct * 100, 2),
+                reason=selection.reason,
+            )
+            changed = self._switch_to_symbol(selection.symbol)
+            if changed:
+                self._notifier.notify_pair_changed(
+                    new_symbol=selection.symbol,
+                    score=round(selection.score, 4),
+                    regime=selection.regime.regime,
+                    atr_pct=selection.regime.atr_pct,
+                )
+        else:
+            logger.debug(
+                "pair_eval_mantiene_par",
+                symbol=selection.symbol,
+                score=round(selection.score, 4),
+                reason=selection.reason,
+            )
+
     # ------------------------------------------------------------------
     # Ciclo de operación
     # ------------------------------------------------------------------
@@ -375,7 +532,14 @@ class MultiBotLoop:
         self._running = True
 
         while self._running:
-            if self._should_switch() and len(self._tokens) > 1:
+            if self._pair_selector is not None:
+                # Modo inteligente: PairSelector decide el par
+                self._cycles_since_pair_eval += 1
+                if self._cycles_since_pair_eval >= self._pair_eval_every_cycles:
+                    self._cycles_since_pair_eval = 0
+                    self._evaluate_and_maybe_switch()
+            elif self._should_switch() and len(self._tokens) > 1:
+                # Modo round-robin (sin PairSelector)
                 self._switch_to_next()
 
             self._run_cycle()

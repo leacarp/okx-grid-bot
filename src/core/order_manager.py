@@ -119,7 +119,14 @@ class OrderManager:
         open_count = 0  # contador de órdenes abiertas durante la inicialización
 
         for level in grid_levels:
-            if level.price >= current_price:
+            # Si el nivel tiene side pre-asignado (grilla asimétrica), respetarlo.
+            # Si no (RANGING), decidir por precio como siempre.
+            is_sell_level = (
+                level.side == "sell"
+                if level.side
+                else level.price >= current_price
+            )
+            if is_sell_level:
                 if btc_per_sell > 0 and btc_remaining >= btc_per_sell:
                     order = self._client.create_limit_order(
                         symbol=_sym,

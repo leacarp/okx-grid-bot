@@ -21,6 +21,17 @@ risk:
   min_order_usdt: 0.5
   min_order_btc: 0.00001  # Mínimo de OKX para BTC/USDT; SELLs con menos se omiten
 
+market_analysis:
+  candle_timeframe: "1h"
+  candle_count: 24
+  atr_period: 14
+  sma_period: 20
+  min_score_to_trade: 0.3
+  vol_weight: 10.0
+  spread_weight: 100.0
+  hysteresis_margin: 0.20       # 20% mínimo de mejora para cambiar de par
+  pair_eval_every_cycles: 10    # cada cuántos ciclos re-evaluar el par óptimo
+
 exchange:
   sandbox: false
 

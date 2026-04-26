@@ -144,6 +144,65 @@ class TelegramNotifier:
             f"Mínimo requerido: ${required:,.4f}"
         )
 
+    def notify_pair_changed(
+        self,
+        new_symbol: str,
+        score: float,
+        regime: str,
+        atr_pct: float,
+    ) -> None:
+        """
+        Notifica el cambio de par seleccionado por PairSelector.
+
+        Args:
+            new_symbol: Nuevo par seleccionado (ej. "ETH/USDT").
+            score: Score de utilidad del nuevo par (0.0 a 1.0).
+            regime: Régimen de mercado (RANGING, TRENDING_UP, TRENDING_DOWN).
+            atr_pct: ATR expresado como porcentaje del precio (ej. 0.032 = 3.2%).
+        """
+        self.send(
+            f"\U0001f504 Cambiando a {new_symbol}\n"
+            f"Score: {score:.2f} | R\u00e9gimen: {regime} | ATR: {atr_pct * 100:.1f}%"
+        )
+
+    def notify_no_suitable_pair(self, best_symbol: str, best_score: float, min_score: float) -> None:
+        """Notifica que ningún par supera el score mínimo para operar."""
+        self.send(
+            f"\u26a0\ufe0f Ningún par apto para operar\n"
+            f"Mejor par: {best_symbol} | Score: {best_score:.2f} | M\u00ednimo: {min_score:.2f}"
+        )
+
+    def notify_weekly_summary(
+        self,
+        trades: int,
+        ganancia_neta: float,
+        mejor_par: str,
+        mejor_par_profit: float,
+        peor_par: str,
+        peor_par_profit: float,
+    ) -> None:
+        """
+        Envía el resumen semanal de PnL a Telegram (domingos a las 00:00 UTC).
+
+        Args:
+            trades: Número total de trades completados en la semana.
+            ganancia_neta: Ganancia neta total en USDT.
+            mejor_par: Símbolo con mayor ganancia (ej: "BTC/USDT").
+            mejor_par_profit: Ganancia neta del mejor par en USDT.
+            peor_par: Símbolo con menor ganancia o mayor pérdida (ej: "SOL/USDT").
+            peor_par_profit: Ganancia/pérdida neta del peor par en USDT.
+        """
+        net_sign = "+" if ganancia_neta >= 0 else "-"
+        mejor_sign = "+" if mejor_par_profit >= 0 else "-"
+        peor_sign = "+" if peor_par_profit >= 0 else "-"
+
+        self.send(
+            f"\U0001f4c8 Resumen semanal\n"
+            f"Trades: {trades} | Ganancia neta: {net_sign}${abs(ganancia_neta):.2f} USDT\n"
+            f"Mejor par: {mejor_par} ({mejor_sign}${abs(mejor_par_profit):.2f})\n"
+            f"Peor par: {peor_par} ({peor_sign}${abs(peor_par_profit):.2f})"
+        )
+
     def notify_daily_summary(
         self,
         winning_trades: int,

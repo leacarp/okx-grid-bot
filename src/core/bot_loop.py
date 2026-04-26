@@ -15,8 +15,9 @@ from src.core.order_manager import OrderManager
 from src.core.pnl_tracker import PnLTracker
 from src.core.price_reader import PriceReader
 from src.risk.risk_manager import RiskManager
-from src.strategy.grid_calculator import GridCalculator
+from src.strategy.grid_calculator import GridCalculator, REGIME_RANGING
 from src.strategy.grid_state import GridState
+from src.strategy.market_analyzer import MarketAnalyzer
 from src.utils.logger import get_logger
 from src.utils.notifier import TelegramNotifier
 
@@ -42,6 +43,7 @@ class BotLoop:
         order_manager: OrderManager | None = None,
         notifier: TelegramNotifier | None = None,
         pnl_tracker: PnLTracker | None = None,
+        market_analyzer: MarketAnalyzer | None = None,
     ) -> None:
         self._config = config
         self._grid_cfg = config["grid"]
@@ -73,6 +75,15 @@ class BotLoop:
         self._total_cycles = 0
         self._last_no_usdt_notification: float | None = None
         self._last_daily_report_date: str | None = None
+        self._last_weekly_report_week: str | None = None
+
+        # range_width_pct: desde config si existe, o derivado del rango original
+        _mid = (self._price_min + self._price_max) / 2
+        self._range_width_pct: float | None = (
+            float(self._grid_cfg["range_width_pct"])
+            if "range_width_pct" in self._grid_cfg
+            else (self._original_range / _mid * 100 if _mid > 0 else None)
+        )
 
         # Construcción de dependencias (inyectables para tests)
         if client is None:
@@ -99,6 +110,7 @@ class BotLoop:
             )
         self._order_manager = order_manager
         self._notifier: TelegramNotifier = notifier or TelegramNotifier()
+        self._market_analyzer: MarketAnalyzer | None = market_analyzer
 
         signal.signal(signal.SIGINT, self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -111,6 +123,36 @@ class BotLoop:
         """Graceful shutdown al recibir SIGINT (Ctrl+C) o SIGTERM."""
         logger.info("señal_recibida", signum=signum)
         self._running = False
+
+    # ------------------------------------------------------------------
+    # Análisis de mercado
+    # ------------------------------------------------------------------
+
+    def _get_market_analysis(self) -> tuple[str, float, float | None]:
+        """
+        Consulta el régimen, score y ATR actuales via MarketAnalyzer.
+
+        Returns:
+            Tupla (regime, score, atr_pct) donde:
+            - regime: "RANGING", "TRENDING_UP" o "TRENDING_DOWN".
+            - score: utilidad del par para grid trading (0.0–1.0).
+            - atr_pct: ATR como ratio decimal (ej: 0.03 = 3%), o None si falla.
+            Retorna ("RANGING", 0.5, None) si no hay MarketAnalyzer o falla el análisis.
+        """
+        if self._market_analyzer is None:
+            return REGIME_RANGING, 0.5, None
+
+        try:
+            market_regime = self._market_analyzer.analyze(self._symbol)
+            return market_regime.regime, market_regime.score, market_regime.atr_pct
+        except Exception as exc:
+            logger.warning("error_analizando_mercado", error=str(exc))
+            return REGIME_RANGING, 0.5, None
+
+    def _get_current_regime(self) -> str:
+        """Retorna solo el régimen de mercado actual (wrapper de _get_market_analysis)."""
+        regime, _, _ = self._get_market_analysis()
+        return regime
 
     # ------------------------------------------------------------------
     # Inicialización de la grilla
@@ -199,14 +241,24 @@ class BotLoop:
             except Exception as exc:
                 logger.warning("error_consultando_balance_al_iniciar", error=str(exc))
 
+            regime, score, atr_pct = self._get_market_analysis()
+            min_order_usdt: float = float(self._risk_cfg.get("min_order_usdt", 0.0))
             calculator = GridCalculator(
                 price_min=self._price_min,
                 price_max=self._price_max,
                 num_levels=self._grid_cfg["num_levels"],
                 total_capital_usdt=self._grid_cfg["total_capital_usdt"],
                 max_order_usdt=self._max_order_usdt,
+                min_order_usdt=min_order_usdt,
+                range_width_pct=self._range_width_pct,
             )
-            grid_levels = calculator.calculate()
+            grid_levels = calculator.calculate(regime=regime, score=score, atr_pct=atr_pct)
+            logger.info(
+                "position_sizing_elegido",
+                score=round(score, 4),
+                atr_pct=round(atr_pct * 100, 2) if atr_pct is not None else None,
+                regime=regime,
+            )
 
             current_price = self._price_reader.get_current_price()
             placed = self._order_manager.place_initial_orders(
@@ -313,14 +365,23 @@ class BotLoop:
             self._order_manager.cancel_all_orders()
             self._grid_state.clear_levels()
 
+            regime, score, atr_pct = self._get_market_analysis()
             calculator = GridCalculator(
                 price_min=nuevo_min,
                 price_max=nuevo_max,
                 num_levels=num_levels,
                 total_capital_usdt=self._grid_cfg["total_capital_usdt"],
                 max_order_usdt=self._max_order_usdt,
+                min_order_usdt=min_order_usdt,
+                range_width_pct=self._range_width_pct,
             )
-            new_levels = calculator.calculate()
+            new_levels = calculator.calculate(regime=regime, score=score, atr_pct=atr_pct)
+            logger.info(
+                "position_sizing_elegido",
+                score=round(score, 4),
+                atr_pct=round(atr_pct * 100, 2) if atr_pct is not None else None,
+                regime=regime,
+            )
 
             self._price_min = nuevo_min
             self._price_max = nuevo_max
@@ -430,6 +491,71 @@ class BotLoop:
         )
 
     # ------------------------------------------------------------------
+    # Reporte semanal
+    # ------------------------------------------------------------------
+
+    def _send_weekly_report(self) -> None:
+        """
+        Envía el resumen semanal de PnL a Telegram una vez por semana (domingos a las 00:00 UTC).
+
+        Se llama en cada ciclo; internamente verifica si hoy es domingo y si ya
+        se envió el reporte esta semana. El reporte incluye trades totales, ganancia
+        neta, mejor par y peor par del período de los últimos 7 días.
+        """
+        now = datetime.now(timezone.utc)
+        if now.isoweekday() != 7:  # 7 = domingo
+            return
+
+        week_key = now.strftime("%Y-W%W")
+        if self._last_weekly_report_week == week_key:
+            return
+
+        self._last_weekly_report_week = week_key
+
+        from datetime import timedelta
+
+        week_ago = now - timedelta(days=7)
+        weekly_cycles = [
+            c
+            for c in self._pnl_tracker._cycles
+            if datetime.fromisoformat(c.completed_at) >= week_ago
+        ]
+
+        if not weekly_cycles:
+            logger.info(
+                "reporte_semanal_omitido",
+                motivo="sin_ciclos_completados_esta_semana",
+            )
+            return
+
+        trades = len(weekly_cycles)
+        ganancia_neta = round(sum(c.net_profit for c in weekly_cycles), 4)
+
+        by_symbol: dict[str, float] = {}
+        for c in weekly_cycles:
+            sym = c.buy_fill.symbol
+            by_symbol[sym] = round(by_symbol.get(sym, 0.0) + c.net_profit, 8)
+
+        mejor_par = max(by_symbol, key=lambda s: by_symbol[s])
+        peor_par = min(by_symbol, key=lambda s: by_symbol[s])
+
+        logger.info(
+            "reporte_semanal_enviado",
+            trades=trades,
+            ganancia_neta=ganancia_neta,
+            mejor_par=mejor_par,
+            peor_par=peor_par,
+        )
+        self._notifier.notify_weekly_summary(
+            trades=trades,
+            ganancia_neta=ganancia_neta,
+            mejor_par=mejor_par,
+            mejor_par_profit=round(by_symbol[mejor_par], 4),
+            peor_par=peor_par,
+            peor_par_profit=round(by_symbol[peor_par], 4),
+        )
+
+    # ------------------------------------------------------------------
     # Ciclo principal
     # ------------------------------------------------------------------
 
@@ -448,6 +574,7 @@ class BotLoop:
         """
         try:
             self._send_daily_report()
+            self._send_weekly_report()
 
             current_price = self._price_reader.get_current_price()
             self._cycles_since_recenter += 1
