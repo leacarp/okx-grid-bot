@@ -57,6 +57,7 @@ class OrderManager:
         grid_levels: list["GridLevel"],
         current_price: float,
         base_available: float = 0.0,
+        symbol: str | None = None,
     ) -> int:
         """
         Coloca órdenes BUY en niveles por debajo del precio actual y SELL en
@@ -78,6 +79,8 @@ class OrderManager:
         Returns:
             Número de órdenes colocadas exitosamente (BUYs + SELLs).
         """
+        _sym = symbol or self._symbol
+
         if self._state.levels:
             logger.info("ordenes_iniciales_omitidas", motivo="estado_existente_cargado")
             return 0
@@ -119,7 +122,7 @@ class OrderManager:
             if level.price >= current_price:
                 if btc_per_sell > 0 and btc_remaining >= btc_per_sell:
                     order = self._client.create_limit_order(
-                        symbol=self._symbol,
+                        symbol=_sym,
                         side="sell",
                         amount=btc_per_sell,
                         price=level.price,
@@ -133,7 +136,7 @@ class OrderManager:
                         open_count += 1
                         logger.info(
                             "orden_inicial_colocada",
-                            symbol=self._symbol,
+                            symbol=_sym,
                             side="sell",
                             price=level.price,
                             amount=round(btc_per_sell, 8),
@@ -165,7 +168,7 @@ class OrderManager:
                 continue
 
             order = self._client.create_limit_order(
-                symbol=self._symbol,
+                symbol=_sym,
                 side="buy",
                 amount=level.order_size_base,
                 price=level.price,
@@ -179,7 +182,7 @@ class OrderManager:
                 open_count += 1
                 logger.info(
                     "orden_inicial_colocada",
-                    symbol=self._symbol,
+                    symbol=_sym,
                     side="buy",
                     price=level.price,
                     amount=round(level.order_size_base, 8),
@@ -194,7 +197,7 @@ class OrderManager:
             "num_levels": len(grid_levels),
         }
         self._state.initialize(
-            symbol=self._symbol,
+            symbol=_sym,
             grid_config=grid_config,
             levels=levels_data,
         )
@@ -215,6 +218,7 @@ class OrderManager:
     def check_filled_orders(
         self,
         current_price: float | None = None,
+        symbol: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Detecta órdenes que ya se ejecutaron.
@@ -232,6 +236,8 @@ class OrderManager:
         Returns:
             Lista de niveles cuyas órdenes fueron ejecutadas.
         """
+        _sym = symbol or self._symbol
+
         if self._client.dry_run:
             if current_price is None:
                 return []
@@ -278,7 +284,7 @@ class OrderManager:
             return filled
 
         open_order_ids = {
-            o["id"] for o in self._client.fetch_open_orders(self._symbol)
+            o["id"] for o in self._client.fetch_open_orders(_sym)
         }
 
         filled = []
@@ -332,6 +338,7 @@ class OrderManager:
 
         target_level = target_levels[0]
         new_price: float = target_level["price"]
+        previous_target_order_id: str | None = target_level.get("order_id")
 
         # Verificar risk antes de colocar la nueva orden
         open_count = sum(
@@ -364,34 +371,30 @@ class OrderManager:
             self._state.update_level(index, f"{side}_filled")
 
             # Cuando SELL se ejecuta → ciclo completo (BUY anterior + esta SELL)
-            # El precio del BUY original es el mismo que el del nuevo BUY a colocar (target)
+            # Se registra PnL real: intenta usar fills del exchange y, si falla,
+            # cae a un cálculo conservador con precio esperado.
             if side == "sell" and self._pnl_tracker is not None:
-                buy_price = new_price               # price del nivel target (donde va el nuevo BUY)
-                sell_price = filled_level["price"]  # price de la SELL que acaba de llenar
-
-                buy_fill = self._pnl_tracker.record_fill(
-                    order_id=f"buy_{target_index}",
-                    symbol=self._symbol,
+                buy_fill = self._build_fill_record(
+                    order_id=previous_target_order_id,
                     side="buy",
-                    amount=amount,
-                    price=buy_price,
-                    fee=0.0,
+                    fallback_order_id=f"buy_{target_index}",
+                    fallback_amount=amount,
+                    fallback_price=new_price,
                 )
-                sell_fill = self._pnl_tracker.record_fill(
-                    order_id=filled_level.get("order_id") or f"sell_{index}",
-                    symbol=self._symbol,
+                sell_fill = self._build_fill_record(
+                    order_id=filled_level.get("order_id"),
                     side="sell",
-                    amount=amount,
-                    price=sell_price,
-                    fee=0.0,
+                    fallback_order_id=f"sell_{index}",
+                    fallback_amount=amount,
+                    fallback_price=filled_level["price"],
                 )
                 cycle = self._pnl_tracker.record_cycle(buy_fill, sell_fill)
                 self._state.record_profit(cycle.net_profit)
                 logger.info(
                     "ciclo_completado_pnl",
                     symbol=self._symbol,
-                    buy_price=buy_price,
-                    sell_price=sell_price,
+                    buy_price=buy_fill.price,
+                    sell_price=sell_fill.price,
                     net_profit=cycle.net_profit,
                 )
 
@@ -412,23 +415,77 @@ class OrderManager:
         )
         return None
 
+    def _build_fill_record(
+        self,
+        order_id: str | None,
+        side: str,
+        fallback_order_id: str,
+        fallback_amount: float,
+        fallback_price: float,
+    ) -> Any:
+        """
+        Construye un FillRecord usando datos reales del exchange cuando estén disponibles.
+
+        En modo real intenta leer trades por order_id; si no puede, hace fallback
+        al precio/cantidad esperados para no romper el flujo de reciclado.
+        """
+        price = fallback_price
+        amount = fallback_amount
+        fee = 0.0
+        effective_order_id = order_id or fallback_order_id
+
+        if not self._client.dry_run and order_id:
+            try:
+                trade_data = self._client.fetch_order_trades(order_id, self._symbol)
+                if isinstance(trade_data, dict):
+                    trade_price = float(trade_data.get("price", 0.0) or 0.0)
+                    trade_amount = float(trade_data.get("amount", 0.0) or 0.0)
+                    trade_fee = float(trade_data.get("fee", 0.0) or 0.0)
+                    if trade_price > 0:
+                        price = trade_price
+                    if trade_amount > 0:
+                        amount = trade_amount
+                    if trade_fee >= 0:
+                        fee = trade_fee
+            except Exception as exc:
+                logger.warning(
+                    "error_obteniendo_fill_real",
+                    side=side,
+                    order_id=order_id,
+                    symbol=self._symbol,
+                    error=str(exc),
+                )
+
+        return self._pnl_tracker.record_fill(
+            order_id=effective_order_id,
+            symbol=self._symbol,
+            side=side,
+            amount=amount,
+            price=price,
+            fee=fee,
+        )
+
     # ------------------------------------------------------------------
     # Limpieza / shutdown
     # ------------------------------------------------------------------
 
-    def cancel_all_orders(self) -> int:
+    def cancel_all_orders(self, symbol: str | None = None) -> int:
         """
-        Cancela todas las órdenes abiertas. Llamado en shutdown.
+        Cancela todas las órdenes abiertas. Llamado en shutdown o al cambiar de par.
+
+        Args:
+            symbol: Símbolo a usar al cancelar. Si None usa self._symbol.
 
         Returns:
             Número de órdenes canceladas.
         """
+        _sym = symbol or self._symbol
         cancelled = 0
         for level in self._state.levels:
             order_id = level.get("order_id")
             status = level.get("status", "")
             if order_id and status.endswith("_open"):
-                self._client.cancel_order(order_id, self._symbol)
+                self._client.cancel_order(order_id, _sym)
                 self._state.update_level(level["index"], "cancelled")
                 cancelled += 1
 

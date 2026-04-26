@@ -47,12 +47,13 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="OKX Grid Trading Bot")
     parser.add_argument(
         "--mode",
-        choices=["scan", "live"],
+        choices=["scan", "live", "multi"],
         default="scan",
         help=(
             "Modo de operación: "
             "'scan' lee precio y balance; "
-            "'live' ejecuta el grid loop (DRY_RUN=true por defecto)."
+            "'live' ejecuta el grid loop single-token; "
+            "'multi' itera en round-robin sobre todos los tokens del config."
         ),
     )
     parser.add_argument(
@@ -144,6 +145,31 @@ def run_live(config: dict, log, cycles: int) -> None:
     log.info("modo_live_completo", ciclos=bot.total_cycles, dry_run=dry_run)
 
 
+def run_multi(config: dict, log, cycles: int) -> None:
+    """
+    Modo multi: itera en round-robin sobre todos los tokens de config["tokens"].
+
+    Cada token se opera durante pair_cooldown_seconds (por defecto 2 horas) antes
+    de rotar al siguiente. Si la nueva grilla falla, mantiene el token anterior.
+    """
+    from src.core.multi_bot_loop import MultiBotLoop
+
+    dry_run: bool = config["dry_run"]
+    symbols = [t["symbol"] for t in config.get("tokens", [])]
+
+    log.info("modo_multi_inicio", symbols=symbols, dry_run=dry_run, max_cycles=cycles)
+
+    bot = MultiBotLoop(config=config)
+    bot.run(max_cycles=cycles)
+
+    log.info(
+        "modo_multi_completo",
+        ciclos=bot.total_cycles,
+        ultimo_symbol=bot.current_symbol,
+        dry_run=dry_run,
+    )
+
+
 def main() -> None:
     _start_health_server()
 
@@ -172,6 +198,8 @@ def main() -> None:
             run_scan(config, log)
         elif args.mode == "live":
             run_live(config, log, cycles=args.cycles)
+        elif args.mode == "multi":
+            run_multi(config, log, cycles=args.cycles)
     except KeyboardInterrupt:
         log.info("bot_detenido_por_usuario")
         sys.exit(0)

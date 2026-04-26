@@ -503,6 +503,32 @@ class TestPnLTrackerIntegracion:
 
         assert result is not None  # la orden se recicló correctamente
 
+    def test_live_usa_fills_reales_para_calcular_profit(
+        self,
+        mock_client_live,
+        grid_state,
+        tmp_path,
+        mock_exchange,
+    ):
+        tracker = PnLTracker(history_file=tmp_path / "hist.json")
+        om = make_order_manager(mock_client_live, grid_state, pnl_tracker=tracker)
+        self._setup_two_levels(grid_state)
+
+        # BUY previo ejecutado a 60010 con fee 0.05, SELL actual a 63740 con fee 0.07
+        # net = (63740 - 60010) * 0.00003 - (0.05 + 0.07) = -0.0081
+        mock_exchange.fetch_order_trades.side_effect = [
+            [{"amount": 0.00003, "cost": 1.8003, "fee": {"cost": 0.05, "currency": "USDT"}}],
+            [{"amount": 0.00003, "cost": 1.9122, "fee": {"cost": 0.07, "currency": "USDT"}}],
+        ]
+
+        filled_sell = grid_state.levels[1]
+        om.recycle_order(filled_sell)
+
+        summary = tracker.get_summary()
+        assert summary.total_cycles == 1
+        assert summary.net_profit == pytest.approx(-0.0081, abs=1e-8)
+        assert grid_state.total_profit == pytest.approx(-0.0081, abs=1e-8)
+
 
 # ------------------------------------------------------------------
 # Tests de pre_order_check cableado en recycle_order
