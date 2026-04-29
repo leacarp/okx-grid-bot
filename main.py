@@ -190,7 +190,7 @@ def main() -> None:
         "bot_iniciado",
         modo=args.mode,
         dry_run=config["dry_run"],
-        symbol=config["grid"]["symbol"],
+        symbol=config["tokens"][0]["symbol"] if config.get("tokens") else "multi",
     )
 
     try:

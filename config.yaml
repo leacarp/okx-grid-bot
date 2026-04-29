@@ -1,17 +1,17 @@
 tokens:
   - symbol: "BTC/USDT"
-    num_levels: 6
-    min_step_usdt: 600
+    num_levels: 8
+    min_step_usdt: 400
   - symbol: "ETH/USDT"
-    num_levels: 6
-    min_step_usdt: 30
+    num_levels: 8
+    min_step_usdt: 20
   - symbol: "SOL/USDT"
-    num_levels: 6
-    min_step_usdt: 3
+    num_levels: 8
+    min_step_usdt: 2
 
 grid:
-  total_capital_usdt: 5.0
-  max_order_usdt: 1.0
+  total_capital_usdt: 100.0
+  max_order_usdt: 12.5
   range_width_pct: 5.0
 
 risk:
@@ -33,7 +33,7 @@ market_analysis:
   pair_eval_every_cycles: 10    # cada cuántos ciclos re-evaluar el par óptimo
 
 exchange:
-  sandbox: false
+  sandbox: true
 
 loop:
   interval_seconds: 5
